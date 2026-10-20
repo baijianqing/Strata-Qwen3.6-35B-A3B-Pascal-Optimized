@@ -985,10 +985,15 @@ bool Prefill::init(std::string& err) {
     p_ = new Impl;
     Impl& P = *p_;
     const Config& c = e_.model_.cfg;
+    // 4 GB Pascal profile defaults: long prompts use the layer-major path; short prompts keep chunk-major
+    // through STRATA_PREFILL_PHASE_MIN.  Every switch still accepts an explicit =0.
+    P.layer_major = true;
     if (const char* v = std::getenv("STRATA_PREFILL_LAYER_MAJOR")) P.layer_major = std::strcmp(v, "0") != 0;
+    P.dense_f32 = P.layer_major;
     if (const char* v = std::getenv("STRATA_PREFILL_DENSE_F32"))
         P.dense_f32 = P.layer_major && *v && std::strcmp(v, "0") != 0;
     if (const char* v = std::getenv("STRATA_PREFILL_LAYER_TILE")) P.layer_tile = std::atoi(v);
+    P.gdn_columns = 4;
     if (const char* v = std::getenv("STRATA_PREFILL_GDN_COLUMNS")) P.gdn_columns = std::atoi(v);
     SQ_CHECK(P.gdn_columns == 1 || P.gdn_columns == 4, "STRATA_PREFILL_GDN_COLUMNS must be 1 or 4");
     if (P.gdn_columns == 4) log("prefill GDN: 4 state columns per warp, shared q/k loads, no additional workspace");
@@ -1008,7 +1013,7 @@ bool Prefill::init(std::string& err) {
     if (const char* v = std::getenv("STRATA_PREFILL_GROUP_PREFETCH"))
         P.group_prefetch = P.layer_major && *v && std::strcmp(v, "0") != 0;
     P.mmq_layer.assign(e_.model_.layers.size(), 0);
-    if (const char* v = std::getenv("STRATA_PREFILL_MMQ"); v && *v && std::strcmp(v, "0") != 0) {
+    if (const char* v = std::getenv("STRATA_PREFILL_MMQ"); !v || (*v && std::strcmp(v, "0") != 0)) {
         for (size_t i = 0; i < e_.model_.layers.size(); ++i) {
             const LayerW& L = e_.model_.layers[i];
             P.mmq_layer[i] = strata::prefill::mmq::fits((int)L.t_gu, 2 * kFF) &&
@@ -1016,7 +1021,7 @@ bool Prefill::init(std::string& err) {
             P.use_mmq |= P.mmq_layer[i] != 0;
         }
     }
-    if (const char* v = std::getenv("STRATA_PREFILL_WORKSPACE_COMPACT"); v && *v && std::strcmp(v, "0") != 0) {
+    if (const char* v = std::getenv("STRATA_PREFILL_WORKSPACE_COMPACT"); !v || (*v && std::strcmp(v, "0") != 0)) {
         P.compact_workspace = P.layer_major && P.use_mmq &&
             std::all_of(P.mmq_layer.begin(), P.mmq_layer.end(), [](char x) { return x != 0; });
         if (!P.compact_workspace)
@@ -1030,7 +1035,7 @@ bool Prefill::init(std::string& err) {
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
     CUBLAS_CHECK(cublasSetMathMode(P.cb, prop.major >= 7 ? CUBLAS_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH));
-    if (const char* v = std::getenv("STRATA_PREFILL_DENSE_ALGO6"); v && std::strcmp(v, "1") == 0) {
+    if (const char* v = std::getenv("STRATA_PREFILL_DENSE_ALGO6"); !v || std::strcmp(v, "0") != 0) {
 #if !defined(__HIPCC__) && !defined(GGML_USE_HIP)
         P.dense_algo6 = P.layer_major && P.dense_f32 && prop.major == 6 && prop.minor == 1;
         if (P.dense_algo6) {
@@ -1172,10 +1177,11 @@ bool Prefill::init(std::string& err) {
     }
     const size_t shared_limit = std::max(prop.sharedMemPerBlock, prop.sharedMemPerBlockOptin);
     P.small_attn = shared_limit < attn_smem<8>();
+    P.shared_attn_kv = true;
     if (const char* v = std::getenv("STRATA_PREFILL_ATTN_KV_SHARED"))
         P.shared_attn_kv = *v && std::strcmp(v, "0") != 0;
     if (P.shared_attn_kv) {
-        P.attn_aq = 4;
+        P.attn_aq = 6;
         if (const char* v = std::getenv("STRATA_PREFILL_ATTN_AQ")) P.attn_aq = std::atoi(v);
         switch (P.attn_aq) {
             case 2: configure_shared_attn<2>(prop, shared_limit); break;
@@ -1193,7 +1199,7 @@ bool Prefill::init(std::string& err) {
         }
         if (P.small_attn) log("prompt attention: 2-token tile (%zu bytes shared memory) for %s", attn_smem<2>(), prop.name);
     }
-    if (const char* v = std::getenv("STRATA_PREFILL_ATTN_BANK_LAYOUT"); v && std::strcmp(v, "1") == 0) {
+    if (const char* v = std::getenv("STRATA_PREFILL_ATTN_BANK_LAYOUT"); !v || std::strcmp(v, "0") != 0) {
         P.attn_bank_layout = P.layer_major && P.shared_attn_kv && P.attn_aq == 6;
         if (P.attn_bank_layout) {
             constexpr size_t bytes = attn_layout_smem<6, true, true, true>();

@@ -33,7 +33,7 @@ struct EngineOptions {
     std::string model_path;
     int ctx = 32768;
     int cpu_threads = 8;
-    int64_t vram_reserve_mb = 1200;  // left free on the card once the engine is ready (other programs, driver)
+    int64_t vram_reserve_mb = 32;  // left free on the card once the engine is ready (other programs, driver)
     int64_t cache_mb = -1;           // expert cache size; -1 = everything that is free
     std::string profile_path;        // expert routing profile used to pick the resident experts
     bool use_graph = true;
@@ -248,6 +248,7 @@ private:
     std::unique_ptr<Prefill> prefill_;
     bool prefill_phase_switch_ = false;       // long prompts temporarily borrow the expert-cache VRAM
     bool prefill_snapshot_loan_ = false;      // long prompts also release unused MTP rollback frames
+    int  phase_switch_min_ = 512;            // prompt length at which the borrowed-workspace path starts
     std::vector<int8_t> head_q_;
     std::vector<float> head_d_, head_logits_;  // staging buffers for the optional CPU LM head
     bool head_last_only_ = false;             // feed's prompt batches need only the last row; never MTP verify

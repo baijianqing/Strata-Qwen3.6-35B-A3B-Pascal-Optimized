@@ -135,6 +135,7 @@ private:
     uint8_t* dev_arena_ = nullptr;
     int64_t dev_used_ = 0, dev_cap_ = 0;
     std::vector<uint8_t*> pinned_;
+    std::vector<uint8_t*> pageable_;   // experts allocated with malloc when cudaHostAlloc refuses (WSL2)
     std::vector<uint8_t> tok_embd_copy_;
     std::vector<int8_t> head_qs_;
     std::vector<uint16_t> head_d_;

@@ -68,6 +68,7 @@ Model::~Model() {
     if (head_dev_) cudaFree(head_dev_);
     if (dev_arena_) cudaFree(dev_arena_);
     for (auto* p : pinned_) cudaFreeHost(p);
+    for (auto* p : pageable_) std::free(p);
 #ifdef _WIN32
     if (expert_cache_base_) UnmapViewOfFile(expert_cache_base_);
     if (expert_cache_mapping_) CloseHandle((HANDLE)expert_cache_mapping_);
@@ -324,7 +325,10 @@ DF32 Model::upload_f32(const std::vector<const GgufTensor*>& parts) {
     const int64_t cols = parts[0]->ne[0];
     int64_t rows = 0;
     for (auto* t : parts) {
-        SQ_CHECK(t->type == T_F32 || t->type == T_BF16 || t->type == T_F16, "%s: expected F32", t->name.c_str());
+        // BF16 is the MTP block's router; F16 and the quantized rows (Q8_0 in MiniCPM-V's ssm_alpha/ssm_beta)
+        // are decoded to f32 here.
+        SQ_CHECK(t->type == T_F32 || t->type == T_BF16 || t->type == T_F16 || can_dequant(t->type),
+                 "%s: expected F32", t->name.c_str());
         SQ_CHECK(t->ne[0] == cols || t->n_elements() == cols, "%s: column mismatch", t->name.c_str());
         rows += t->n_elements() / cols;
     }
@@ -404,7 +408,7 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     const char* cpu_head_env = std::getenv("STRATA_CPU_LM_HEAD");
     cpu_lm_head = cpu_head_env && std::string(cpu_head_env) == "1";
     const char* phase_head_env = std::getenv("STRATA_PREFILL_HEAD_LOAN");
-    phase_lm_head = !cpu_lm_head && phase_head_env && std::string(phase_head_env) == "1";
+    phase_lm_head = !cpu_lm_head && !(phase_head_env && std::string(phase_head_env) == "0");
     const char* native_dense_env = std::getenv("STRATA_NATIVE_DENSE_Q6");
     native_dense_q6 = native_dense_env && std::string(native_dense_env) == "1";
     const char* repack_env = std::getenv("STRATA_DENSE_Q6_REPACK");
@@ -469,6 +473,8 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
             L.wo = upload_q8({&gguf.need(blk(il, "attn_output.weight"))});
         } else {
             L.qkvz = upload_q8({&gguf.need(blk(il, "attn_qkv.weight")), &gguf.need(blk(il, "attn_gate.weight"))});
+            // Fused as one 64 x n_embd f32 matrix.  Qwen3.6 stores both BF16 and MiniCPM-V 4.7 stores both
+            // Q8_0; `upload_f32` dequantizes either form, so the kernels always see f32.
             L.ba = upload_f32({&gguf.need(blk(il, "ssm_beta.weight")), &gguf.need(blk(il, "ssm_alpha.weight"))});
             L.conv_w = upload_vec(gguf.need(blk(il, "ssm_conv1d.weight")));
             L.dt_bias = upload_vec(gguf.need(blk(il, "ssm_dt.bias")));
@@ -506,17 +512,27 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
 
     // ------------------------------------------------ routed experts -> pinned RAM or a pageable disk cache
     expert_bytes = 0;
+    // Expert storage policy.  Native storage keeps the pack's packed bytes, which is what the CPU and prefill
+    // expert kernels consume; anything they do not implement is converted to Q6_K at load.  Default: native
+    // where supported, convert otherwise.  STRATA_NATIVE_EXPERTS=0 forces the legacy convert-everything policy
+    // (Q4_K/Q5_K/Q6_K pass through, everything else becomes Q6_K).
     const char* native_env = std::getenv("STRATA_NATIVE_EXPERTS");
-    const bool native_iq = native_env && std::atoi(native_env) != 0;
-    auto compute_type = [native_iq](uint32_t t) {
-        if (native_iq) {
-            SQ_CHECK(t == T_IQ2_S || t == T_IQ3_S || t == T_IQ4_XS || t == T_Q2_K || t == T_Q3_K ||
-                     t == T_Q4_K || t == T_Q5_K || t == T_Q6_K,
-                     "native expert kernel unavailable for %s; refusing implicit requantization", type_name(t));
-            return t;
-        }
+    const bool native_preference = !(native_env && std::atoi(native_env) == 0);
+    auto native_supported = [](uint32_t t) {
+        return t == T_IQ2_S || t == T_IQ3_S || t == T_IQ4_XS || t == T_Q2_K || t == T_Q3_K || t == T_Q4_K ||
+               t == T_Q5_K || t == T_Q6_K;
+    };
+    auto compute_type = [&](uint32_t t) {
+        if (native_preference && native_supported(t)) return t;
         return t == T_Q4_K || t == T_Q5_K || t == T_Q6_K ? t : (uint32_t)T_Q6_K;
     };
+    const bool native_any = [&] {
+        for (int il = 0; il < c.n_moe_layers(); ++il)
+            if (native_supported(gguf.need(blk(il, "ffn_gate_exps.weight")).type) &&
+                native_supported(gguf.need(blk(il, "ffn_down_exps.weight")).type))
+                return true;
+        return false;
+    }();
     for (int il = 0; il < c.n_moe_layers(); ++il) {
         LayerW& L = layers[il];
         const GgufTensor& g = gguf.need(blk(il, "ffn_gate_exps.weight"));
@@ -537,12 +553,13 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     const char* cache_path = std::getenv("STRATA_EXPERT_CACHE_FILE");
     const bool mapped_cache = cache_path && *cache_path;
     int completed_layers = 0;
-    if (native_iq) log("expert storage: original native packed weights (IQ2_S/IQ3_S/IQ4_XS/Q2_K/Q3_K/K-quants); no requantization");
+    if (native_any) log("expert storage: native packed weights (IQ2_S/IQ3_S/IQ4_XS/Q2_K/Q3_K/K-quants); no requantization");
     else log("expert storage: legacy K-quants; fallback Q6_K %s",
              fast_expert_conversion_ ? "fast weighted fit" : "reference scale search");
     if (mapped_cache && !open_expert_cache(cache_path, path, completed_layers, err)) return false;
     log("expert arena: %.2f GiB of %s for %d layers x %d experts", expert_bytes / 1073741824.0,
         mapped_cache ? "pageable file-backed storage" : "pinned RAM", c.n_moe_layers(), c.n_expert);
+    bool pageable_fallback_logged = false;
     int64_t cache_offset = kCacheHeaderBytes;
     for (int il = 0; il < c.n_moe_layers(); ++il) {
         LayerW& L = layers[il];
@@ -555,9 +572,24 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
         uint8_t* p = nullptr;
         cudaError_t e = cudaHostAlloc((void**)&p, (size_t)(L.blob_bytes * c.n_expert), cudaHostAllocPortable);
         if (e != cudaSuccess) {
-            err = "cannot pin " + std::to_string(L.blob_bytes * c.n_expert >> 20) + " MiB of RAM for layer " +
-                  std::to_string(il) + " experts: " + cudaGetErrorString(e);
-            return false;
+            if (e != cudaErrorMemoryAllocation) {
+                err = "cannot pin experts: " + std::string(cudaGetErrorString(e));
+                return false;
+            }
+            // Pageable sources remain usable, but host-to-device copies may synchronize.
+            (void)cudaGetLastError();
+            if (!pageable_fallback_logged) {
+                log("cannot pin %.0f MiB for layer %d experts (%s); using pageable host memory",
+                    L.blob_bytes * c.n_expert / 1048576.0, il, cudaGetErrorString(e));
+                pageable_fallback_logged = true;
+            }
+            p = (uint8_t*)std::malloc((size_t)(L.blob_bytes * c.n_expert));
+            SQ_CHECK(p != nullptr, "cannot allocate %.0f MiB for layer %d experts",
+                     L.blob_bytes * c.n_expert / 1048576.0, il);
+            pageable_.push_back(p);
+            L.experts = p;
+            L.experts_pinned = false;
+            continue;
         }
         pinned_.push_back(p);
         L.experts = p;

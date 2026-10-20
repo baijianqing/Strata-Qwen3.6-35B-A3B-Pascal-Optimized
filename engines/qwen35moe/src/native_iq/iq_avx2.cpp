@@ -40,7 +40,7 @@ inline bool cpu_avxvnni_ok() { return false; }
 inline bool iq256_inline_rows_enabled() {
     static const bool enabled = [] {
         const char* s = std::getenv("STRATA_IQ_INLINE_ROWS");
-        return s && std::atoi(s) != 0;
+        return !s || std::atoi(s) != 0;
     }();
     return enabled;
 }

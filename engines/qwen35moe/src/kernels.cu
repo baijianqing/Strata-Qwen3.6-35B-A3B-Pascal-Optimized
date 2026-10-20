@@ -1361,7 +1361,7 @@ bool gpu_expert_reuse_enabled() {
     // making reuse a default; a process-level opt-in also keeps captured launch selection stable.
     static const bool enabled = [] {
         const char* value = std::getenv("STRATA_GPU_EXPERT_REUSE");
-        return value && value[0] == '1' && value[1] == '\0';
+        return !value || (value[0] == '1' && value[1] == '\0');
     }();
     return enabled;
 }

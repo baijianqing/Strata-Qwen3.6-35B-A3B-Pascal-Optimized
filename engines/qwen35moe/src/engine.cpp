@@ -109,8 +109,8 @@ Engine::~Engine() {
 
 bool Engine::init(const EngineOptions& opt, std::string& err) {
     opt_ = opt;
-    prefill_phase_switch_ = env_mib("STRATA_PREFILL_PHASE_SWITCH", 0, 1) != 0;
-    prefill_snapshot_loan_ = env_mib("STRATA_PREFILL_SNAPSHOT_LOAN", 0, 1) != 0;
+    prefill_phase_switch_ = env_mib("STRATA_PREFILL_PHASE_SWITCH", 1, 1) != 0;
+    prefill_snapshot_loan_ = env_mib("STRATA_PREFILL_SNAPSHOT_LOAN", 1, 1) != 0;
     SQ_CHECK(!prefill_snapshot_loan_ || prefill_phase_switch_,
              "STRATA_PREFILL_SNAPSHOT_LOAN requires STRATA_PREFILL_PHASE_SWITCH=1");
     if (env_mib("STRATA_NATIVE_DENSE_Q6", 0, 1) != 0) {
@@ -136,12 +136,12 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
     cache_budget_extra_mib_ = env_mib("STRATA_CACHE_BUDGET_EXTRA_MIB", 0, 1024);
     const char* sync_env = std::getenv("STRATA_SYNC_MOE");
     sync_moe_ = sync_env && std::string(sync_env) == "1";
-    event_moe_ = env_mib("STRATA_EVENT_MOE", 0, 1) != 0;
+    event_moe_ = env_mib("STRATA_EVENT_MOE", 1, 1) != 0;
     miss_stream_eligible_limit_ = (int)env_mib("STRATA_MISS_STREAM_EXPERTS", 0, 256);
     miss_stream_capacity_ = std::min(miss_stream_eligible_limit_, kMaxU);
     mtp_last_row_ = env_mib("STRATA_MTP_LAST_ROW", 0, 1) != 0;
     event_blocking_ = env_mib("STRATA_EVENT_BLOCKING", 0, 1) != 0;
-    early_gpu_moe_ = env_mib("STRATA_MOE_EARLY_GPU", 0, 1) != 0;
+    early_gpu_moe_ = env_mib("STRATA_MOE_EARLY_GPU", 1, 1) != 0;
     // env_mib returns the fallback only when absent; supplied values remain strictly bounded to 0/1.
     prompt_early_gpu_ = (int)env_mib("STRATA_PROMPT_EARLY_GPU", 2, 1);
     event_graph_moe_ = env_mib("STRATA_EVENT_MOE_GRAPH", 0, 1) != 0;
@@ -152,9 +152,9 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
     prompt_full_graph_ = env_mib("STRATA_PROMPT_FULL_GRAPH", 0, 1) != 0;
     event_graph_blocking_ = env_mib("STRATA_EVENT_GRAPH_BLOCKING", 0, 1) != 0;
     profile_pipeline_ = env_mib("STRATA_PROFILE_PIPELINE", 0, 1) != 0;
-    flush_moe_submit_ = env_mib("STRATA_MOE_FLUSH", 0, 1) != 0;
+    flush_moe_submit_ = env_mib("STRATA_MOE_FLUSH", 1, 1) != 0;
     if (profile_pipeline_) opt_.use_graph = false;
-    async_cache_ = env_mib("STRATA_ASYNC_CACHE", 0, 1) != 0;
+    async_cache_ = env_mib("STRATA_ASYNC_CACHE", 1, 1) != 0;
     direct_pinned_cache_ = env_mib("STRATA_CACHE_DIRECT_PINNED", 0, 1) != 0;
     rebalance_every_ = (int)env_mib("STRATA_CACHE_REBALANCE_EVERY", 0, 65536);
     rebalance_max_bytes_ = env_mib("STRATA_CACHE_REBALANCE_MAX_MIB", 128, 512) * 1048576ll;
@@ -246,8 +246,11 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
         log("prompt MTP KV catch-up shares the next trunk wait; deferred GPU time is in feed/trunk time, not mtp_ms (submission only)");
     opt_.ctx = std::min(opt_.ctx, c.ctx_train);
     opt_.ctx = (opt_.ctx + 255) / 256 * 256;
+    // Keep the two thresholds separate: `prefill_min` decides whether ANY batched prefill is used (it must stay
+    // low, or a 1K prompt falls back to per-token decode), while the phase switch - which borrows the expert
+    // cache and the LM head for a layer-major workspace - only pays off on longer prompts.
     if (prefill_phase_switch_)
-        opt_.prefill_min = std::max(opt_.prefill_min,
+        phase_switch_min_ = std::max(opt_.prefill_min,
             (int)env_mib("STRATA_PREFILL_PHASE_MIN", 512, opt_.ctx));
     kv_capacity_ = opt_.ctx;
     if (kv_initial_tokens_ > 0) {
@@ -635,7 +638,7 @@ void Engine::setup_cache() {
     // What the warm-up and graph capture still allocate after this point (init() trims the cache if
     // it turns out to be more).  Without it that memory would come out of the reserve, and under WDDM an
     // over-full card spills to system memory instead of failing.
-    const int64_t init_reserve_mib = env_mib("STRATA_CACHE_INIT_RESERVE_MIB", 768, 4096);
+    const int64_t init_reserve_mib = env_mib("STRATA_CACHE_INIT_RESERVE_MIB", 0, 4096);
     int64_t budget = (int64_t)fr + cache_budget_extra_mib_ * 1048576ll
                      - opt_.vram_reserve_mb * 1048576ll - init_reserve_mib * 1048576ll;
     if (opt_.cache_mb >= 0) budget = std::min<int64_t>(budget, opt_.cache_mb * 1048576ll);
@@ -2145,7 +2148,7 @@ void Engine::feed(const int* tokens, int n) {
         }
         ~PromptScope() { head = previous_head; snapshots = previous_snapshots; }
     };
-    if (prefill_phase_switch_ && opt_.prefill_chunk > 0 && n >= opt_.prefill_min) {
+    if (prefill_phase_switch_ && opt_.prefill_chunk > 0 && n >= phase_switch_min_) {
         const double t0 = now_ms();
         // Grow only to this request's end. Lazy KV first returns the necessary cache slots; the remaining slots
         // are then lent to the prompt workspace and restored after the prompt has completed.
@@ -2188,7 +2191,7 @@ void Engine::feed(const int* tokens, int n) {
     }
     // Bounded prompt batching reuses the already allocated decode scratch.  Unlike the large prefill path it
     // needs no GEMM/staging workspace.  Keep it opt-in and on the event hand-off until the other paths are audited.
-    int prompt_batch = 1;
+    int prompt_batch = 4;   // medium prompts below the phase-switch threshold: 4-token decode batches
     if (const char* v = std::getenv("STRATA_PROMPT_BATCH")) {
         SQ_CHECK(std::strcmp(v, "1") == 0 || std::strcmp(v, "2") == 0 || std::strcmp(v, "4") == 0,
                  "STRATA_PROMPT_BATCH must be 1, 2 or 4");
