@@ -247,11 +247,12 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
     opt_.ctx = std::min(opt_.ctx, c.ctx_train);
     opt_.ctx = (opt_.ctx + 255) / 256 * 256;
     // Keep the two thresholds separate: `prefill_min` decides whether ANY batched prefill is used (it must stay
-    // low, or a 1K prompt falls back to per-token decode), while the phase switch - which borrows the expert
-    // cache and the LM head for a layer-major workspace - only pays off on longer prompts.
+    // low, or a short prompt falls back to per-token decode), while the phase switch - which borrows the expert
+    // cache and the LM head for a layer-major workspace - starts at 8 tokens.  Measured on the 4 GB Pascal
+    // profile: below the old 512 threshold a 64-token prompt took 3.3 s versus 1.2 s on this path.
     if (prefill_phase_switch_)
         phase_switch_min_ = std::max(opt_.prefill_min,
-            (int)env_mib("STRATA_PREFILL_PHASE_MIN", 512, opt_.ctx));
+            (int)env_mib("STRATA_PREFILL_PHASE_MIN", 8, opt_.ctx));
     kv_capacity_ = opt_.ctx;
     if (kv_initial_tokens_ > 0) {
         const int wanted = std::min(kv_initial_tokens_, opt_.ctx);

@@ -248,7 +248,7 @@ private:
     std::unique_ptr<Prefill> prefill_;
     bool prefill_phase_switch_ = false;       // long prompts temporarily borrow the expert-cache VRAM
     bool prefill_snapshot_loan_ = false;      // long prompts also release unused MTP rollback frames
-    int  phase_switch_min_ = 512;            // prompt length at which the borrowed-workspace path starts
+    int  phase_switch_min_ = 8;            // prompt length at which the borrowed-workspace path starts
     std::vector<int8_t> head_q_;
     std::vector<float> head_d_, head_logits_;  // staging buffers for the optional CPU LM head
     bool head_last_only_ = false;             // feed's prompt batches need only the last row; never MTP verify
