@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <initializer_list>
 #include <thread>
@@ -62,9 +63,38 @@ std::wstring wide_path(const std::string& s) {
 }
 #endif
 
+// Register the malloc-owned pages of a host copy so cudaMemcpy uses pinned DMA instead of a staging bounce.
+// The vector start need not be page-aligned: the registration may extend backwards within the owning page.
+template <typename T>
+void pin_host_pages(std::vector<T>& v, void*& region, size_t& region_bytes, const char* what) {
+    if (v.empty()) return;
+    const uintptr_t page = 4096;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(v.data());
+    const uintptr_t base = addr & ~(page - 1);
+    const size_t bytes = (size_t)(addr - base) + v.size() * sizeof(T);
+    const cudaError_t e = cudaHostRegister(reinterpret_cast<void*>(base), bytes, cudaHostRegisterDefault);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();
+        log("LM head host copy (%s): pinning failed (%s); restore stays pageable", what, cudaGetErrorString(e));
+        return;
+    }
+    region = reinterpret_cast<void*>(base);
+    region_bytes = bytes;
+}
+
 }  // namespace
 
+void Model::pin_lm_head_host() {
+    pin_host_pages(head_qs_, head_qs_pin_, head_qs_pin_bytes_, "q8");
+    pin_host_pages(head_d_, head_d_pin_, head_d_pin_bytes_, "scales");
+    if (head_qs_pin_ && head_d_pin_)
+        log("LM head restore source pinned (%.1f MiB); phase-switch recovery uses pinned DMA",
+            (head_qs_pin_bytes_ + head_d_pin_bytes_) / 1048576.0);
+}
+
 Model::~Model() {
+    if (head_qs_pin_) cudaHostUnregister(head_qs_pin_);
+    if (head_d_pin_) cudaHostUnregister(head_d_pin_);
     if (head_dev_) cudaFree(head_dev_);
     if (dev_arena_) cudaFree(dev_arena_);
     for (auto* p : pinned_) cudaFreeHost(p);
@@ -490,6 +520,7 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     const GgufTensor* out = gguf.tensor("output.weight");
     lm_head = upload_q8({out ? out : &te}, cpu_lm_head || phase_lm_head);
     if (phase_lm_head) {
+        pin_lm_head_host();
         restore_lm_head();
         dense_bytes += head_dev_bytes_;
         log("LM head: %.1f MiB phase-loan allocation with host Q8 restore copy", head_dev_bytes_ / 1048576.0);

@@ -254,6 +254,12 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
     if (prefill_phase_switch_)
         phase_switch_min_ = std::max(opt_.prefill_min,
             (int)env_mib("STRATA_PREFILL_PHASE_MIN", 8, opt_.ctx));
+    // Short prompts size the layer-major workspace to their own tile and keep the expert cache resident: no trim,
+    // no refill, and the prefill streams only the experts that are not already on the card.  0 disables this path.
+    prefill_short_max_ = (int)env_mib("STRATA_PREFILL_SHORT_MAX", 512, opt_.ctx);
+    if (prefill_phase_switch_ && prefill_short_max_ > 0)
+        log("short prompt prefill: up to %d tokens keep the expert cache resident (prompt-sized workspace)",
+            prefill_short_max_);
     kv_capacity_ = opt_.ctx;
     if (kv_initial_tokens_ > 0) {
         const int wanted = std::min(kv_initial_tokens_, opt_.ctx);
@@ -894,19 +900,16 @@ void Engine::trim_cache(int64_t bytes) {
         dropped, freed / 1048576.0, (long long)opt_.vram_reserve_mb, (long long)cache_budget_extra_mib_);
 }
 
-// Rebuild the cache after the prompt path borrowed its VRAM. Capacities are the post-KV-growth per-layer slot
-// counts. Prompt routes are folded into the normal decayed frequency before choosing each layer's hottest experts.
-void Engine::refill_cache_after_prefill(const std::vector<std::vector<int>>& previous_layout) {
+// Fold the routes seen since the last snapshot into the decayed frequency, normalized to one adaptation round.
+// The bounded decode path adapts every `adapt_every` tokens, so one update contributes only K*adapt_every routes
+// per layer. A prompt supplies hundreds or thousands of tokens at once; adding that raw total would erase the
+// long-run profile and overfit the cache to the whole prompt, so only its distribution is retained.
+void Engine::fold_route_counts() {
     const Config& c = model_.cfg;
     const int NL = c.n_moe_layers(), NE = c.n_expert;
-    SQ_CHECK((int)previous_layout.size() == NL && cache_bytes_ == 0, "invalid phase-switched cache refill state");
     CUDA_CHECK(cudaMemcpyAsync(route_host_.data(), route_counts_, route_host_.size() * sizeof(uint32_t),
                                cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
-    // The bounded decode path adapts every `adapt_every` tokens, so one update contributes only K*adapt_every
-    // routes per layer. A large prefill supplies hundreds or thousands of tokens at once; adding that raw total
-    // would erase the long-run profile and overfit the cache to the whole prompt. Preserve its distribution while
-    // normalizing its mass to one ordinary adaptation round.
     std::vector<uint64_t> layer_delta(NL, 0);
     for (int layer = 0; layer < NL; ++layer)
         for (int expert = 0; expert < NE; ++expert)
@@ -920,6 +923,15 @@ void Engine::refill_cache_after_prefill(const std::vector<std::vector<int>>& pre
         const double normalized = total > 0 ? delta * round_mass / total : 0.0;
         freq_[i] = freq_[i] * opt_.adapt_decay + normalized;
     }
+}
+
+// Rebuild the cache after the prompt path borrowed its VRAM. Capacities are the post-KV-growth per-layer slot
+// counts. Prompt routes are folded into the normal decayed frequency before choosing each layer's hottest experts.
+void Engine::refill_cache_after_prefill(const std::vector<std::vector<int>>& previous_layout) {
+    const Config& c = model_.cfg;
+    const int NL = c.n_moe_layers(), NE = c.n_expert;
+    SQ_CHECK((int)previous_layout.size() == NL && cache_bytes_ == 0, "invalid phase-switched cache refill state");
+    fold_route_counts();
     std::fill(residency_host_.begin(), residency_host_.end(), -1);
     cache_slots_total_ = 0;
     std::vector<CacheLayerInfo> info(NL);
@@ -2163,6 +2175,62 @@ void Engine::feed(const int* tokens, int n) {
             dst = now - tp;
             tp = now;
         };
+        if (prefill_short_max_ > 0 && n <= prefill_short_max_) {
+            // Short prompts size the layer-major workspace to their own rows and release only the LM head.  The
+            // expert cache stays intact, so resident experts run from VRAM, the refill H2D disappears, and the
+            // prompt routes are folded into the decayed frequencies instead (the next adaptation uses them).
+            ensure_kv_capacity(n_past_ + n);
+            mark(pt.kv_ms);
+            CUDA_CHECK(cudaStreamSynchronize(stream_));
+            CUDA_CHECK(cudaStreamSynchronize(copy_stream_));   // drain adaptive uploads; no cache change
+            mark(pt.trim_ms);
+            const int64_t head_lent = model_.release_lm_head();
+            mark(pt.head_release_ms);
+            size_t free_now = 0, total_now = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_now, &total_now));
+            // The 128 MiB window reserve plus the C=512 workspace (~220 MiB) needs a conservative margin.
+            // Elsewhere (CPU LM head, larger models) fall back to the full borrow path.
+            if (free_now >= (size_t)448 * 1048576) {
+                const int tile = ((n + 127) / 128) * 128;
+                prefill_ = std::make_unique<Prefill>(*this);
+                std::string prefill_error;
+                SQ_CHECK(prefill_->init(prefill_error, tile),
+                         "short prompt prefill initialization failed: %s", prefill_error.c_str());
+                mark(pt.init_ms);   // prompt-sized workspace allocation
+                prefill_->run(tokens, n);
+                mark(pt.run_ms);
+                prefill_.reset();
+                mark(pt.teardown_ms);
+                if (head_lent > 0) {
+                    model_.restore_lm_head();
+                    k_gemv_q8(model_.lm_head, xq_, logits_, 1, stream_);
+                    CUDA_CHECK(cudaStreamSynchronize(stream_));
+                }
+                mark(pt.head_restore_ms);
+                fold_route_counts();
+                mark(pt.refill_ms);
+                stats.prefill_ms += now_ms() - t0;
+                stats.prefill_tokens += n;
+                n_past_ += n;
+                history_.insert(history_.end(), tokens, tokens + n);
+                logits_valid_ = true;
+                if (phase_switch_profile_) {
+                    pt.total_ms = now_ms() - t0;
+                    pt.slots = cache_slots_total_;
+                    log("SHORT_PREFILL_PROFILE tokens=%d tile=%d slots=%lld kv=%.2f drain=%.2f "
+                        "head_release=%.2f init=%.2f run=%.2f teardown=%.2f head_restore=%.2f "
+                        "route_fold=%.2f total=%.2f ms", pt.tokens, tile, (long long)pt.slots, pt.kv_ms,
+                        pt.trim_ms, pt.head_release_ms, pt.init_ms, pt.run_ms, pt.teardown_ms,
+                        pt.head_restore_ms, pt.refill_ms, pt.total_ms);
+                }
+                return;
+            }
+            // Not enough headroom: restore the head and take the full borrow path below.
+            if (head_lent > 0) model_.restore_lm_head();
+            pt = PhaseSwitchTiming{};
+            pt.tokens = n;
+            tp = now_ms();
+        }
         // Grow only to this request's end. Lazy KV first returns the necessary cache slots; the remaining slots
         // are then lent to the prompt workspace and restored after the prompt has completed.
         ensure_kv_capacity(n_past_ + n);

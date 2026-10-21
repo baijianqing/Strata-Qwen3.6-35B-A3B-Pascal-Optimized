@@ -141,6 +141,11 @@ private:
     std::vector<uint16_t> head_d_;
     uint8_t* head_dev_ = nullptr;
     int64_t head_dev_bytes_ = 0;
+    void* head_qs_pin_ = nullptr;      // registered host pages: the phase-loan restore is on the request path
+    size_t head_qs_pin_bytes_ = 0;
+    void* head_d_pin_ = nullptr;
+    size_t head_d_pin_bytes_ = 0;
+    void pin_lm_head_host();
     uint8_t* expert_cache_base_ = nullptr;
     void* expert_cache_file_ = nullptr;
     void* expert_cache_mapping_ = nullptr;

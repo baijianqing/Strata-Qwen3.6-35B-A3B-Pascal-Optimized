@@ -982,7 +982,7 @@ Prefill::~Prefill() {
     }
 }
 
-bool Prefill::init(std::string& err) {
+bool Prefill::init(std::string& err, int tile_override) {
     (void)err;
     p_ = new Impl;
     Impl& P = *p_;
@@ -995,6 +995,8 @@ bool Prefill::init(std::string& err) {
     if (const char* v = std::getenv("STRATA_PREFILL_DENSE_F32"))
         P.dense_f32 = P.layer_major && *v && std::strcmp(v, "0") != 0;
     if (const char* v = std::getenv("STRATA_PREFILL_LAYER_TILE")) P.layer_tile = std::atoi(v);
+    // A short prompt allocates only the rows it uses; the configured tile remains the upper bound.
+    if (tile_override > 0) P.layer_tile = std::min(P.layer_tile, tile_override);
     P.gdn_columns = 4;
     if (const char* v = std::getenv("STRATA_PREFILL_GDN_COLUMNS")) P.gdn_columns = std::atoi(v);
     SQ_CHECK(P.gdn_columns == 1 || P.gdn_columns == 4, "STRATA_PREFILL_GDN_COLUMNS must be 1 or 4");
