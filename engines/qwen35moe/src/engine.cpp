@@ -152,6 +152,7 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
     prompt_full_graph_ = env_mib("STRATA_PROMPT_FULL_GRAPH", 0, 1) != 0;
     event_graph_blocking_ = env_mib("STRATA_EVENT_GRAPH_BLOCKING", 0, 1) != 0;
     profile_pipeline_ = env_mib("STRATA_PROFILE_PIPELINE", 0, 1) != 0;
+    phase_switch_profile_ = env_mib("STRATA_PHASE_SWITCH_PROFILE", 0, 1) != 0;
     flush_moe_submit_ = env_mib("STRATA_MOE_FLUSH", 1, 1) != 0;
     if (profile_pipeline_) opt_.use_graph = false;
     async_cache_ = env_mib("STRATA_ASYNC_CACHE", 1, 1) != 0;
@@ -2151,43 +2152,73 @@ void Engine::feed(const int* tokens, int n) {
     };
     if (prefill_phase_switch_ && opt_.prefill_chunk > 0 && n >= phase_switch_min_) {
         const double t0 = now_ms();
+        PhaseSwitchTiming pt;
+        pt.tokens = n;
+        double tp = t0;
+        // Buffered diagnostic: timestamps only, no extra synchronization. Every segment below already ends at a
+        // host-visible boundary (trim/refill/run each own their final stream sync).
+        auto mark = [&](double& dst) {
+            if (!phase_switch_profile_) return;
+            const double now = now_ms();
+            dst = now - tp;
+            tp = now;
+        };
         // Grow only to this request's end. Lazy KV first returns the necessary cache slots; the remaining slots
         // are then lent to the prompt workspace and restored after the prompt has completed.
         ensure_kv_capacity(n_past_ + n);
+        mark(pt.kv_ms);
         const std::vector<std::vector<int>> previous_layout = slot_expert_;
         const int64_t lent_bytes = cache_bytes_;
         if (lent_bytes > 0) trim_cache(lent_bytes);
         CUDA_CHECK(cudaStreamSynchronize(stream_));
         CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+        mark(pt.trim_ms);
         int64_t snapshot_lent = 0;
         if (prefill_snapshot_loan_ && snap_arena_) {
             snapshot_lent = (size_t)opt_.mtp_draft * state_floats_ * sizeof(float);
             CUDA_CHECK(cudaFree(snap_arena_));
             snap_arena_ = nullptr;
         }
+        mark(pt.snapshot_release_ms);
         const int64_t head_lent = model_.release_lm_head();
+        mark(pt.head_release_ms);
         log("phase-switched prefill: borrowed %.1f MiB cache + %.1f MiB rollback + %.1f MiB LM head "
             "for %d tokens (chunk %d)", lent_bytes / 1048576.0, snapshot_lent / 1048576.0,
             head_lent / 1048576.0, n, opt_.prefill_chunk);
         prefill_ = std::make_unique<Prefill>(*this);
         std::string prefill_error;
         SQ_CHECK(prefill_->init(prefill_error), "phase-switched prefill initialization failed: %s", prefill_error.c_str());
+        mark(pt.init_ms);   // workspace allocation + per-prompt MMQ packing
         prefill_->run(tokens, n);
+        mark(pt.run_ms);
         prefill_.reset();
+        mark(pt.teardown_ms);   // workspace frees (cudaFree synchronizes)
         if (head_lent > 0) {
             model_.restore_lm_head();
             k_gemv_q8(model_.lm_head, xq_, logits_, 1, stream_);
             CUDA_CHECK(cudaStreamSynchronize(stream_));
         }
+        mark(pt.head_restore_ms);   // H2D copy + first logits GEMV
         if (snapshot_lent > 0) {
             CUDA_CHECK(cudaMalloc(&snap_arena_, (size_t)snapshot_lent));
         }
+        mark(pt.snapshot_alloc_ms);
         refill_cache_after_prefill(previous_layout);
+        mark(pt.refill_ms);
         stats.prefill_ms += now_ms() - t0;
         stats.prefill_tokens += n;
         n_past_ += n;
         history_.insert(history_.end(), tokens, tokens + n);
         logits_valid_ = true;
+        if (phase_switch_profile_) {
+            pt.total_ms = now_ms() - t0;
+            pt.slots = cache_slots_total_;
+            log("PHASE_SWITCH_PROFILE tokens=%d slots=%lld kv=%.2f trim=%.2f snap_release=%.2f "
+                "head_release=%.2f init=%.2f run=%.2f teardown=%.2f head_restore=%.2f snap_alloc=%.2f "
+                "refill=%.2f total=%.2f ms", pt.tokens, (long long)pt.slots, pt.kv_ms, pt.trim_ms,
+                pt.snapshot_release_ms, pt.head_release_ms, pt.init_ms, pt.run_ms, pt.teardown_ms,
+                pt.head_restore_ms, pt.snapshot_alloc_ms, pt.refill_ms, pt.total_ms);
+        }
         return;
     }
     // Bounded prompt batching reuses the already allocated decode scratch.  Unlike the large prefill path it
@@ -2346,6 +2377,12 @@ static bool is_prefix(const std::vector<int>& p, const std::vector<int>& s) {
 }
 
 int Engine::reuse_prefix(const std::vector<int>& prompt) {
+    const double t0 = phase_switch_profile_ ? now_ms() : 0;
+    auto report = [&](int reused) {
+        if (phase_switch_profile_)
+            log("PREFIX_PROFILE reused=%d prompt=%d ms=%.2f", reused, (int)prompt.size(), now_ms() - t0);
+        return reused;
+    };
     // Positions past the common prefix are about to be rewritten (KV caches), so a checkpoint that is not a prefix
     // of this prompt can no longer be restored.
     for (auto& ck : ckpts_)
@@ -2361,9 +2398,9 @@ int Engine::reuse_prefix(const std::vector<int>& prompt) {
             pick = &ck;
         }
     if (!pick) {
-        if (best > 0) return best;
+        if (best > 0) return report(best);
         reset();
-        return 0;
+        return report(0);
     }
     CUDA_CHECK(cudaMemcpyAsync(state_arena_, pick->arena, state_floats_ * 4, cudaMemcpyDeviceToDevice, stream_));
     CUDA_CHECK(cudaMemcpyAsync(mtp_hin_, pick->hin, (size_t)kMaxT * model_.cfg.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
@@ -2373,15 +2410,21 @@ int Engine::reuse_prefix(const std::vector<int>& prompt) {
     n_past_ = (int)history_.size();
     logits_valid_ = false;
     mtp_k_ = pick->mtp_k;
-    return n_past_;
+    return report(n_past_);
 }
 
 void Engine::save_checkpoint(bool base) {
     if (ckpts_.empty()) return;
+    const double t0 = phase_switch_profile_ ? now_ms() : 0;
     // slot 0 is the base slot when there are two or more; the others rotate (least recently used)
     const size_t first = ckpts_.size() > 1 && !base ? 1 : 0;
     for (auto& ck : ckpts_)
-        if (ck.tokens == history_) { ck.stamp = ++ckpt_clock_; return; }
+        if (ck.tokens == history_) {
+            ck.stamp = ++ckpt_clock_;
+            if (phase_switch_profile_) log("CHECKPOINT_PROFILE tokens=%d base=%d copy=0 ms=%.2f",
+                                           n_past_, base ? 1 : 0, now_ms() - t0);
+            return;
+        }
     Checkpoint* slot = &ckpts_[first];
     if (!base || ckpts_.size() == 1)
         for (size_t i = first; i < ckpts_.size(); ++i)
@@ -2392,6 +2435,8 @@ void Engine::save_checkpoint(bool base) {
     slot->tokens = history_;
     slot->mtp_k = mtp_k_;
     slot->stamp = ++ckpt_clock_;
+    if (phase_switch_profile_) log("CHECKPOINT_PROFILE tokens=%d base=%d copy=1 bytes=%.1fMiB ms=%.2f",
+                                   n_past_, base ? 1 : 0, state_floats_ * 4 / 1048576.0, now_ms() - t0);
 }
 
 std::string Engine::status_line() const {

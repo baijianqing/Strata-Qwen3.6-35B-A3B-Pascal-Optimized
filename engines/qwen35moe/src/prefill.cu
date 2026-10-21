@@ -906,6 +906,8 @@ struct Prefill::Impl {
     int attn_aq = 0;
     bool layer_major = false;
     int layer_tile = 1024;
+    bool phase_profile = false;   // default-off: count streamed expert bytes, no synchronization
+    uint64_t staged_experts = 0, staged_bytes = 0, resident_used = 0;
     bool compact_workspace = false;
     bool dense_f32 = false;
     bool dense_algo6 = false; // Opt-in, prepared main input projections on sm61 only.
@@ -996,6 +998,7 @@ bool Prefill::init(std::string& err) {
     P.gdn_columns = 4;
     if (const char* v = std::getenv("STRATA_PREFILL_GDN_COLUMNS")) P.gdn_columns = std::atoi(v);
     SQ_CHECK(P.gdn_columns == 1 || P.gdn_columns == 4, "STRATA_PREFILL_GDN_COLUMNS must be 1 or 4");
+    if (const char* v = std::getenv("STRATA_PHASE_SWITCH_PROFILE")) P.phase_profile = std::atoi(v) != 0;
     if (P.gdn_columns == 4) log("prefill GDN: 4 state columns per warp, shared q/k loads, no additional workspace");
     if (const char* v = std::getenv("STRATA_PREFILL_DIAGNOSTIC_DIR")) P.diagnostic_dir = v;
     if (const char* v = std::getenv("STRATA_PREFILL_DIAGNOSTIC_LAYER")) P.diagnostic_layer = std::atoi(v);
@@ -1646,6 +1649,7 @@ void Prefill::run_layer_major(const int* tokens, int n) {
     const size_t bytes_per_token = 3 * kE * sizeof(float) + 8 * (sizeof(float) + 2 * sizeof(int)) +
                                    (ordered_combine ? (8 * kE + 257) * sizeof(float) : 0);
     constexpr size_t reserve = (size_t)128 * 1048576;
+    P.staged_experts = P.staged_bytes = P.resident_used = 0;
     for (int done = 0; done < n;) {
         size_t free_now = 0, total_now = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_now, &total_now));
@@ -1667,6 +1671,10 @@ void Prefill::run_layer_major(const int* tokens, int n) {
         run_layer_major_window(tokens, n, done, count, ordered_combine);
         done += count;
     }
+    if (P.phase_profile)
+        log("PHASE_SWITCH_RUN_PROFILE tokens=%d staged_experts=%llu staged=%.2f GiB resident_used=%llu",
+            n, (unsigned long long)P.staged_experts, P.staged_bytes / 1073741824.0,
+            (unsigned long long)P.resident_used);
 }
 
 void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_start, int n, bool ordered_combine) {
@@ -1839,6 +1847,13 @@ void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_
             strata::prefill::mmq::quantize(full_hn, d_perm, P.Xq, (int)L.t_gu, kE, kE, (int64_t)n * 8, s);
         std::vector<int> order;
         for (int e = 0; e < 256; ++e) if (cnt[e + 1] > cnt[e]) order.push_back(e);
+        if (P.phase_profile) {
+            // Every nonresident routed expert is staged exactly once per layer/window; residents run from the cache.
+            for (int e : order) {
+                if (E.residency_host_[(size_t)il * 256 + e] >= 0) ++P.resident_used;
+                else { ++P.staged_experts; P.staged_bytes += (uint64_t)L.blob_bytes; }
+            }
+        }
 
         std::vector<int> stage_of(order.size(), -1);
         size_t next_copy = 0;

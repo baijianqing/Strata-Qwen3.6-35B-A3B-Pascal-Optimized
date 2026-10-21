@@ -390,6 +390,16 @@ private:
     uint64_t rebalance_tokens_ = 0;
     std::vector<double> cpu_pair_ms_;         // smoothed CPU job time per routed expert/token pair, no LM head
     double rebalance_cost_per_byte_ = 0;      // measured allocation + copy cost from earlier rebalances
+    // Default-off phase-switch diagnostics: host-side timestamps only, no per-layer synchronization or
+    // intermediate printing. One buffered line is emitted after the prompt has completed.
+    struct PhaseSwitchTiming {
+        int tokens = 0;
+        int64_t slots = 0;
+        double kv_ms = 0, trim_ms = 0, snapshot_release_ms = 0, head_release_ms = 0;
+        double init_ms = 0, run_ms = 0, teardown_ms = 0, head_restore_ms = 0;
+        double snapshot_alloc_ms = 0, refill_ms = 0, total_ms = 0;
+    };
+    bool phase_switch_profile_ = false;
     // Diagnostic only: CUDA event spans include stream idle gaps, not just kernel execution.
     // Disabled for throughput trials; they distinguish the route/head path from CPU/GPU MoE overlap.
     struct PipelineLayer {

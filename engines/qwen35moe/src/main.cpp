@@ -240,8 +240,11 @@ int serve(Engine& eng, const ServeOptions& so) {
         std::vector<int> cks;
         int base_ck = -1;   // the end of the first (system) message: its own checkpoint slot
         auto add_ck = [&](int pos) { if (pos > reused && pos < n) cks.push_back(pos); };
-        for (int i = n - 1; i >= 0; --i)
-            if (ids[i] == kImStart) { add_ck(i); break; }
+        // The last <|im_start|> begins the assistant generation prompt, so a checkpoint there only helps a
+        // regeneration.  The one before it begins the user message: that is the prefix an edited last user
+        // message can reuse.  Keep both (with 3 slots the end-of-prompt save evicts one of them).
+        for (int i = n - 1, kept = 0; i >= 0 && kept < 2; --i)
+            if (ids[i] == kImStart) { add_ck(i); ++kept; }
         if (ids[0] == kImStart)
             for (int i = 1; i < n; ++i)
                 if (ids[i] == kImEnd) {
