@@ -151,6 +151,11 @@ public:
     }
     int cpu_threads() const { return cpu_ ? cpu_->threads() : 0; }
     uint64_t event_graph_steps() const { return event_graph_steps_; }
+    /// Effective per-request record: paths actually taken by the prompt slices, largest tile, loaded profile id.
+    void reset_prefill_record() { last_prefill_path_.clear(); last_prefill_tile_ = 0; }
+    const std::string& last_prefill_path() const { return last_prefill_path_; }
+    int last_prefill_tile() const { return last_prefill_tile_; }
+    uint32_t profile_id() const { return profile_id_; }
 
     // --- debugging
     void debug_set_miss_stream_eligible(const std::vector<std::vector<int>>& ids); // drained fixed-placement override
@@ -175,6 +180,13 @@ public:
     std::vector<float> debug_mtp_catch_up(int next, bool need_draft); // full MTP head, or KV-only state comparison
     void debug_freeze_cache_adaptation() { opt_.adapt_every = 0; } // retain current placement, including queued uploads
     int debug_prefill_chunk() const { return opt_.prefill_chunk; }
+    int debug_set_prefill_short_max(int value) {
+        SQ_CHECK(!prefill_ && value >= 0 && value <= opt_.ctx,
+                 "changing the short prefill threshold requires an idle deferred prefill");
+        const int previous = prefill_short_max_;
+        prefill_short_max_ = value;
+        return previous;
+    }
     int debug_set_prefill_chunk(int chunk) {
         SQ_CHECK(chunk > 0 && prefill_phase_switch_ && !prefill_,
                  "changing debug prefill chunk requires a positive size and idle deferred prefill");
@@ -402,6 +414,9 @@ private:
         double snapshot_alloc_ms = 0, refill_ms = 0, total_ms = 0;
     };
     bool phase_switch_profile_ = false;
+    std::string last_prefill_path_;      // paths used by this request's prompt slices; "mixed" if they differ
+    int last_prefill_tile_ = 0;
+    uint32_t profile_id_ = 0;            // FNV-1a of the loaded routing profile (0 = none)
     // Diagnostic only: CUDA event spans include stream idle gaps, not just kernel execution.
     // Disabled for throughput trials; they distinguish the route/head path from CPU/GPU MoE overlap.
     struct PipelineLayer {

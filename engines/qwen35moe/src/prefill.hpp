@@ -14,6 +14,7 @@ public:
     /// `tile_override` > 0 sizes the layer-major workspace for a shorter prompt (capped by the configured tile).
     bool init(std::string& err, int tile_override = 0);
     bool ready() const { return ready_; }
+    int tile() const;   // layer-major tile in use (0 before init)
     /// Processes `n` tokens at positions n_past .. n_past+n-1 of the engine; leaves the last token's logits.
     /// With MTP on, also runs the MTP layer over every position whose next token is known (the pending pairs
     /// first), and leaves the last position pending.

@@ -21,8 +21,9 @@
 //   -> QUIT                            save the expert profile (--profile-save) and exit
 //
 // Prefix reuse: the delta-net state cannot be rolled back, so the engine checkpoints positions a follow-up request
-// is likely to resume from - the end of the prompt, the start of its last turn (Qwen's template drops the reasoning
-// of earlier turns, so the next request diverges right after it) and the end of the first (system) message.
+// is likely to resume from - the end of the prompt, the start of the last user message (the prefix an edited last
+// message can reuse) and the end of the first (system) message.  The assistant generation prompt is only a small
+// template preface ahead of the end, so it does not get a slot of its own.
 #include "common.hpp"
 #include "engine.hpp"
 
@@ -96,6 +97,7 @@ void usage() {
         "  --ids a,b,c|@file -n N   generation from token ids (greedy unless --temp)\n"
         "  --temp T --top-k K --top-p P --pres X --seed S   sampling for --ids / --bench\n"
         "  --dump-logits F    write the logits after --ids to F (float32)\n"
+        "  --short-parity     with --ids: short vs long prompt path, prefix and stepwise logits, then greedy tokens\n"
         "  --bench [--bench-prompt N] [-n N]\n"
         "  --selfcheck N      logits of a random N-token prompt: batched prefill vs prefill(N-1) + decode(1)\n"
         "  --selfcheck-layer-major N  chunk/layer-major parity, continuation, prefix reuse and MTP rollback;\n"
@@ -239,12 +241,20 @@ int serve(Engine& eng, const ServeOptions& so) {
         const int reused = eng.reuse_prefix(ids);
         std::vector<int> cks;
         int base_ck = -1;   // the end of the first (system) message: its own checkpoint slot
-        auto add_ck = [&](int pos) { if (pos > reused && pos < n) cks.push_back(pos); };
-        // The last <|im_start|> begins the assistant generation prompt, so a checkpoint there only helps a
-        // regeneration.  The one before it begins the user message: that is the prefix an edited last user
-        // message can reuse.  Keep both (with 3 slots the end-of-prompt save evicts one of them).
-        for (int i = n - 1, kept = 0; i >= 0 && kept < 2; --i)
-            if (ids[i] == kImStart) { add_ck(i); ++kept; }
+        auto add_ck = [&](int pos) {
+            if (pos > reused && pos < n && std::find(cks.begin(), cks.end(), pos) == cks.end())
+                cks.push_back(pos);
+        };
+        // Retain the start of the last user message, not the assistant generation prompt: an edited user
+        // message can only reuse the former, while the end-of-prompt save already covers regeneration after
+        // the missing template preface.  With three slots this keeps base + user start + prompt end.
+        int last_start = -1, user_start = -1;
+        for (int i = n - 1; i >= 0; --i)
+            if (ids[i] == kImStart) {
+                if (last_start < 0) last_start = i;
+                else { user_start = i; break; }
+            }
+        add_ck(user_start >= 0 ? user_start : last_start);
         if (ids[0] == kImStart)
             for (int i = 1; i < n; ++i)
                 if (ids[i] == kImEnd) {
@@ -253,6 +263,7 @@ int serve(Engine& eng, const ServeOptions& so) {
                     break;
                 }
         std::sort(cks.begin(), cks.end());
+        eng.reset_prefill_record();
         int pos = reused;
         while (pos < n) {
             int end = std::min(pos + 4096, n);
@@ -298,9 +309,12 @@ int serve(Engine& eng, const ServeOptions& so) {
         emit("DONE %lld %d %.1f %.1f %s %llu %llu %d %llu %llu %llu 0 0.0", produced, n, prompt_ms, decode_ms, finish,
              (unsigned long long)(eng.stats.accepted - acc0), (unsigned long long)(eng.stats.drafted - off0), reused,
              (unsigned long long)hits, (unsigned long long)(hits + miss), (unsigned long long)miss);
-        log("strata-qwen35moe: prompt %d tokens = %d reused + %d read in %.0f ms (%.1f tok/s), %lld generated in %.0f ms "
+        log("strata-qwen35moe: prompt %d tokens = %d reused + %d read in %.0f ms "
+            "(%.1f tok/s, path %s tile %d profile %08x), %lld generated in %.0f ms "
             "(%.1f tok/s), drafts accepted %llu of %llu%s", n, reused, n - reused, prompt_ms,
-            prompt_ms > 0 ? 1000.0 * (n - reused) / prompt_ms : 0.0, produced, decode_ms,
+            prompt_ms > 0 ? 1000.0 * (n - reused) / prompt_ms : 0.0,
+            eng.last_prefill_path().empty() ? "-" : eng.last_prefill_path().c_str(),
+            eng.last_prefill_tile(), eng.profile_id(), produced, decode_ms,
             decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, (unsigned long long)(eng.stats.accepted - acc0),
             (unsigned long long)(eng.stats.drafted - off0), std::strcmp(finish, "cancel") == 0 ? " (cancelled)" : "");
         const uint64_t prompt_hits = hits_after_prompt - hits0, prompt_miss = miss_after_prompt - miss0;
@@ -511,6 +525,80 @@ int selfcheck_layer_major(Engine& eng, int n) {
 
 }  // namespace
 
+// Compares the long and short prompt paths on the same prefix: last-token logits for several prefix lengths,
+// then per-step logits and greedy tokens for a continuation.  The long path runs first so its refill leaves a
+// cache placement the short path keeps; both decodes therefore see the same expert placement and only the
+// prefill path can differ.  Cache adaptation is frozen for the comparison.
+int short_parity_check(Engine& eng, const std::string& ids_s, int n_gen) {
+    std::vector<int> ids = parse_ids(ids_s);
+    if (ids.size() < 8) { std::printf("short-parity needs at least 8 token ids\n"); return 1; }
+    eng.debug_freeze_cache_adaptation();
+    auto compare = [](const std::vector<float>& a, const std::vector<float>& b, const char* label) {
+        double ma = -1e30, mb = -1e30;
+        for (float v : a) ma = std::max(ma, (double)v);
+        for (float v : b) mb = std::max(mb, (double)v);
+        double sa = 0, sb = 0;
+        for (float v : a) sa += std::exp((double)v - ma);
+        for (float v : b) sb += std::exp((double)v - mb);
+        double kl = 0, maxd = 0;
+        size_t am = 0, bm = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double la = a[i] - ma - std::log(sa), lb = b[i] - mb - std::log(sb);
+            kl += std::exp(la) * (la - lb);
+            if (la > -10) maxd = std::max(maxd, std::abs((double)a[i] - (double)b[i]));
+            if (a[i] > a[am]) am = i;
+            if (b[i] > b[bm]) bm = i;
+        }
+        std::printf("  %-22s KL %.3e, max |dlogit| %.3e, argmax %zu / %zu%s\n", label, kl, maxd, am, bm,
+                    (am == bm && maxd == 0) ? " (identical)" : "");
+        return maxd;
+    };
+    auto capture = [&](int short_max, int plen, std::vector<std::vector<float>>& rows,
+                       std::vector<int>& toks, int steps) {
+        eng.debug_set_prefill_short_max(short_max);
+        eng.reset();
+        eng.feed(ids.data(), plen);
+        rows.push_back(eng.logits_host());
+        std::mt19937_64 rng(1);
+        SamplingParams sp;
+        eng.begin_request(sp);
+        for (int i = 0; i < steps; ++i) {
+            const int tok = eng.sample(sp, rng);
+            toks.push_back(tok);
+            eng.feed(&tok, 1);
+            rows.push_back(eng.logits_host());
+        }
+    };
+    const int plen_max = std::min<int>((int)ids.size(), 512);
+    const int prefixes[] = {8, 16, 32, 64, 96, 128, 256, 511};
+    for (int p : prefixes) {
+        if (p > plen_max) continue;
+        std::vector<std::vector<float>> lo, sh;
+        std::vector<int> lt, st;
+        capture(0, p, lo, lt, 0);
+        capture(512, p, sh, st, 0);
+        char label[64];
+        std::snprintf(label, sizeof(label), "prefix %d", p);
+        compare(lo[0], sh[0], label);
+    }
+    std::vector<std::vector<float>> lo, sh;
+    std::vector<int> lt, st;
+    capture(0, plen_max, lo, lt, n_gen);
+    capture(512, plen_max, sh, st, n_gen);
+    const int steps = (int)std::min(lo.size(), sh.size());
+    int mismatched = 0;
+    double worst = 0;
+    for (int i = 0; i < steps; ++i) {
+        char label[64];
+        std::snprintf(label, sizeof(label), "step %d", i);
+        worst = std::max(worst, compare(lo[i], sh[i], label));
+        if (i > 0 && lt[i - 1] != st[i - 1]) ++mismatched;
+    }
+    std::printf("short-parity: prefix %d, %d continuation rows, token mismatches %d, worst max|dlogit| %.3e\n",
+                plen_max, steps, mismatched, worst);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     EngineOptions opt;
     opt.profile_path = "data/expert-profile-qwen36.bin";
@@ -518,6 +606,7 @@ int main(int argc, char** argv) {
     std::string ids_s, dump_logits;
     int n_gen = 32, bench_prompt = 512, selfcheck = 0, layer_major_check = 0;
     bool do_serve = false, do_bench = false, spec_check = false, layer_major_requested = false;
+    bool short_parity = false;
     SamplingParams sp;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -555,6 +644,7 @@ int main(int argc, char** argv) {
         else if (a == "--ids") ids_s = next();
         else if (a == "-n") n_gen = std::stoi(next());
         else if (a == "--dump-logits") dump_logits = next();
+        else if (a == "--short-parity") short_parity = true;
         else if (a == "--serve") do_serve = true;
         else if (a == "--bench") do_bench = true;
         else if (a == "--bench-prompt") bench_prompt = std::stoi(next());
@@ -595,6 +685,7 @@ int main(int argc, char** argv) {
     Engine eng;
     std::string err;
     if (!eng.init(opt, err)) die("%s", err.c_str());
+    if (short_parity) return short_parity_check(eng, ids_s, n_gen);
     if (layer_major_requested) return selfcheck_layer_major(eng, layer_major_check);
     if (do_serve) return serve(eng, so);
     if (selfcheck > 1) {

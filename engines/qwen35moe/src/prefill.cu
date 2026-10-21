@@ -54,6 +54,11 @@ __global__ void zero_mmq_tails_kernel(uint8_t* gu_tail, uint8_t* down_tail) {
 // Opt-in layer-major timing. These events are separate from the staging ring's dependency events.
 // Stream elapsed time includes scheduling and dependency delays; it is not a kernel-busy counter.
 // Allocate once per window, then reuse only after the existing end-of-layer synchronization.
+// Routed rows per expert: the effective matrix width for one expert in this prompt window.
+inline int routed_row_bucket(int rows) {
+    return rows <= 1 ? 0 : rows <= 4 ? 1 : rows <= 8 ? 2 : rows <= 16 ? 3 : 4;
+}
+
 struct LayerMajorProfile {
     cudaEvent_t phase[5] = {};
     std::vector<cudaEvent_t> copy_begin, copy_end, wait_begin, wait_end;
@@ -908,6 +913,13 @@ struct Prefill::Impl {
     int layer_tile = 1024;
     bool phase_profile = false;   // default-off: count streamed expert bytes, no synchronization
     uint64_t staged_experts = 0, staged_bytes = 0, resident_used = 0;
+    // Default-off per-expert row-count diagnostic: buckets 1, 2-4, 5-8, 9-16, >16 routed rows.
+    bool row_profile = false;
+    uint64_t rb_experts[5] = {}, rb_rows[5] = {}, rb_groups[5] = {};
+    double rb_gu[5] = {}, rb_down[5] = {}, rb_prep[5] = {}, rb_wait[5] = {}, rb_ring[5] = {};
+    cudaEvent_t rb_group[256][5] = {};
+    cudaEvent_t rb_wait_ev[256][2] = {};
+    cudaEvent_t rb_cwait_ev[256][2] = {};
     bool compact_workspace = false;
     bool dense_f32 = false;
     bool dense_algo6 = false; // Opt-in, prepared main input projections on sm61 only.
@@ -947,6 +959,8 @@ struct Prefill::Impl {
 #endif
 };
 
+int Prefill::tile() const { return p_ ? p_->layer_tile : 0; }
+
 Prefill::~Prefill() {
     if (p_) {
         if (p_->s) cudaStreamSynchronize(p_->s);
@@ -955,6 +969,12 @@ Prefill::~Prefill() {
             if (p_->ev_copied[i]) cudaEventDestroy(p_->ev_copied[i]);
             if (p_->ev_free[i]) cudaEventDestroy(p_->ev_free[i]);
         }
+        for (auto& group : p_->rb_group)
+            for (auto event : group) if (event) cudaEventDestroy(event);
+        for (auto& pair : p_->rb_wait_ev)
+            for (auto event : pair) if (event) cudaEventDestroy(event);
+        for (auto& pair : p_->rb_cwait_ev)
+            for (auto event : pair) if (event) cudaEventDestroy(event);
         if (p_->cb) cublasDestroy(p_->cb);
         for (void* q : {(void*)p_->X, (void*)p_->Hn, (void*)p_->big, (void*)p_->ba, (void*)p_->conv,
                         (void*)p_->gb, (void*)p_->rlog, (void*)(p_->compact_workspace ? nullptr : p_->gu),
@@ -1001,6 +1021,7 @@ bool Prefill::init(std::string& err, int tile_override) {
     if (const char* v = std::getenv("STRATA_PREFILL_GDN_COLUMNS")) P.gdn_columns = std::atoi(v);
     SQ_CHECK(P.gdn_columns == 1 || P.gdn_columns == 4, "STRATA_PREFILL_GDN_COLUMNS must be 1 or 4");
     if (const char* v = std::getenv("STRATA_PHASE_SWITCH_PROFILE")) P.phase_profile = std::atoi(v) != 0;
+    if (const char* v = std::getenv("STRATA_PREFILL_ROW_PROFILE")) P.row_profile = std::atoi(v) != 0;
     if (P.gdn_columns == 4) log("prefill GDN: 4 state columns per warp, shared q/k loads, no additional workspace");
     if (const char* v = std::getenv("STRATA_PREFILL_DIAGNOSTIC_DIR")) P.diagnostic_dir = v;
     if (const char* v = std::getenv("STRATA_PREFILL_DIAGNOSTIC_LAYER")) P.diagnostic_layer = std::atoi(v);
@@ -1179,6 +1200,16 @@ bool Prefill::init(std::string& err, int tile_override) {
         CUDA_CHECK(cudaEventCreateWithFlags(&P.ev_copied[i], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&P.ev_free[i], cudaEventDisableTiming));
         CUDA_CHECK(cudaEventRecord(P.ev_free[i], P.s));
+    }
+    if (P.row_profile) {
+        for (auto& group : P.rb_group)
+            for (auto& event : group) CUDA_CHECK(cudaEventCreate(&event));
+        for (auto& pair : P.rb_wait_ev)
+            for (auto& event : pair) CUDA_CHECK(cudaEventCreate(&event));
+        for (auto& pair : P.rb_cwait_ev)
+            for (auto& event : pair) CUDA_CHECK(cudaEventCreate(&event));
+        log("prefill row profile: routed-row buckets 1 / 2-4 / 5-8 / 9-16 / >16; "
+            "diagnostic events add per-group and per-staged-expert overhead");
     }
     const size_t shared_limit = std::max(prop.sharedMemPerBlock, prop.sharedMemPerBlockOptin);
     P.small_attn = shared_limit < attn_smem<8>();
@@ -1652,6 +1683,10 @@ void Prefill::run_layer_major(const int* tokens, int n) {
                                    (ordered_combine ? (8 * kE + 257) * sizeof(float) : 0);
     constexpr size_t reserve = (size_t)128 * 1048576;
     P.staged_experts = P.staged_bytes = P.resident_used = 0;
+    for (int b = 0; b < 5; ++b) {
+        P.rb_experts[b] = P.rb_rows[b] = P.rb_groups[b] = 0;
+        P.rb_gu[b] = P.rb_down[b] = P.rb_prep[b] = P.rb_wait[b] = P.rb_ring[b] = 0;
+    }
     for (int done = 0; done < n;) {
         size_t free_now = 0, total_now = 0;
         CUDA_CHECK(cudaMemGetInfo(&free_now, &total_now));
@@ -1677,6 +1712,24 @@ void Prefill::run_layer_major(const int* tokens, int n) {
         log("PHASE_SWITCH_RUN_PROFILE tokens=%d staged_experts=%llu staged=%.2f GiB resident_used=%llu",
             n, (unsigned long long)P.staged_experts, P.staged_bytes / 1073741824.0,
             (unsigned long long)P.resident_used);
+    if (P.row_profile)
+        log("PREFILL_ROW_PROFILE tokens=%d buckets=1,2-4,5-8,9-16,>16 "
+            "experts=%llu,%llu,%llu,%llu,%llu rows=%llu,%llu,%llu,%llu,%llu "
+            "groups=%llu,%llu,%llu,%llu,%llu prepare_ms=%.2f,%.2f,%.2f,%.2f,%.2f "
+            "gu_ms=%.2f,%.2f,%.2f,%.2f,%.2f down_ms=%.2f,%.2f,%.2f,%.2f,%.2f "
+            "wait_ms=%.2f,%.2f,%.2f,%.2f,%.2f ring_wait_ms=%.2f,%.2f,%.2f,%.2f,%.2f",
+            n, (unsigned long long)P.rb_experts[0], (unsigned long long)P.rb_experts[1],
+            (unsigned long long)P.rb_experts[2], (unsigned long long)P.rb_experts[3],
+            (unsigned long long)P.rb_experts[4], (unsigned long long)P.rb_rows[0],
+            (unsigned long long)P.rb_rows[1], (unsigned long long)P.rb_rows[2],
+            (unsigned long long)P.rb_rows[3], (unsigned long long)P.rb_rows[4],
+            (unsigned long long)P.rb_groups[0], (unsigned long long)P.rb_groups[1],
+            (unsigned long long)P.rb_groups[2], (unsigned long long)P.rb_groups[3],
+            (unsigned long long)P.rb_groups[4], P.rb_prep[0], P.rb_prep[1], P.rb_prep[2], P.rb_prep[3],
+            P.rb_prep[4], P.rb_gu[0], P.rb_gu[1], P.rb_gu[2], P.rb_gu[3], P.rb_gu[4], P.rb_down[0],
+            P.rb_down[1], P.rb_down[2], P.rb_down[3], P.rb_down[4], P.rb_wait[0], P.rb_wait[1],
+            P.rb_wait[2], P.rb_wait[3], P.rb_wait[4], P.rb_ring[0], P.rb_ring[1], P.rb_ring[2],
+            P.rb_ring[3], P.rb_ring[4]);
 }
 
 void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_start, int n, bool ordered_combine) {
@@ -1849,6 +1902,8 @@ void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_
             strata::prefill::mmq::quantize(full_hn, d_perm, P.Xq, (int)L.t_gu, kE, kE, (int64_t)n * 8, s);
         std::vector<int> order;
         for (int e = 0; e < 256; ++e) if (cnt[e + 1] > cnt[e]) order.push_back(e);
+        std::vector<int> row_of(order.size());
+        for (size_t j = 0; j < order.size(); ++j) row_of[j] = cnt[order[j] + 1] - cnt[order[j]];
         if (P.phase_profile) {
             // Every nonresident routed expert is staged exactly once per layer/window; residents run from the cache.
             for (int e : order) {
@@ -1866,7 +1921,9 @@ void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_
                 if (E.residency_host_[(size_t)il * 256 + ex] >= 0) continue;
                 const int sl = ring++ % kStage;
                 stage_of[next_copy] = sl;
+                if (P.row_profile) CUDA_CHECK(cudaEventRecord(P.rb_cwait_ev[next_copy][0], P.cs));
                 CUDA_CHECK(cudaStreamWaitEvent(P.cs, P.ev_free[sl], 0));
+                if (P.row_profile) CUDA_CHECK(cudaEventRecord(P.rb_cwait_ev[next_copy][1], P.cs));
                 if (profile_detail) CUDA_CHECK(cudaEventRecord(profile->copy_begin[next_copy], P.cs));
                 CUDA_CHECK(cudaMemcpyAsync(P.stage + (size_t)sl * P.stage_bytes, L.expert_blob(ex),
                                            (size_t)L.blob_bytes, cudaMemcpyHostToDevice, P.cs));
@@ -1941,6 +1998,13 @@ void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_
             groups.push_back({j0, j1, pass_begin, passes.size()});
             j0 = j1;
         }
+        std::vector<int> gbucket(groups.size());
+        for (size_t g = 0; g < groups.size(); ++g) {
+            int max_rows = 0;
+            for (size_t ip = groups[g].pass_begin; ip < groups[g].pass_end; ++ip)
+                max_rows = std::max(max_rows, passes[ip].max_rows);
+            gbucket[g] = routed_row_bucket(max_rows);
+        }
         const size_t nbounds = host_bounds.size();
         if (nbounds > P.mmq_bounds_capacity) {
             // Prior-layer work is already complete, so neither allocation is still in use. A low diagnostic
@@ -2001,12 +2065,15 @@ void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_
             uint8_t* group_gu = P.group_prefetch && bank ? P.mmq_gu_alt : P.mmq_gu;
             uint8_t* group_down = P.group_prefetch && bank ? P.mmq_down_alt : P.mmq_down;
             const RowPass& first_pass = passes[group.pass_begin];
+            if (P.row_profile) CUDA_CHECK(cudaEventRecord(P.rb_group[g][0], s));
             if (!one_tile_exact)
                 strata::prefill::mmq::quantize(full_hn, d_perm + first_pass.first, P.Xq, (int)L.t_gu,
                                                kE, kE, first_pass.last - first_pass.first, s);
             if (P.group_prefetch) {
                 if (profile_detail) CUDA_CHECK(cudaEventRecord(profile->wait_begin[g], s));
+                if (P.row_profile) CUDA_CHECK(cudaEventRecord(P.rb_wait_ev[g][0], s));
                 CUDA_CHECK(cudaStreamWaitEvent(s, P.mmq_ready[bank], 0));
+                if (P.row_profile) CUDA_CHECK(cudaEventRecord(P.rb_wait_ev[g][1], s));
                 if (profile_detail) CUDA_CHECK(cudaEventRecord(profile->wait_end[g], s));
                 // The bank remains owned by this group through every row subpass. Clear the same
                 // bounded MMQ overread tails before launching its first consumer.
@@ -2021,7 +2088,9 @@ void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_
                     if (slot >= 0) blob = E.slot_base_[il] + (size_t)slot * L.blob_bytes;
                     else {
                         if (profile_detail) CUDA_CHECK(cudaEventRecord(profile->wait_begin[j], s));
+                        if (P.row_profile) CUDA_CHECK(cudaEventRecord(P.rb_wait_ev[j][0], s));
                         CUDA_CHECK(cudaStreamWaitEvent(s, P.ev_copied[stage_of[j]], 0));
+                        if (P.row_profile) CUDA_CHECK(cudaEventRecord(P.rb_wait_ev[j][1], s));
                         if (profile_detail) CUDA_CHECK(cudaEventRecord(profile->wait_end[j], s));
                         blob = P.stage + (size_t)stage_of[j] * P.stage_bytes;
                     }
@@ -2046,7 +2115,9 @@ void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_
                 gu.expert_bytes = layer_gu_stride; gu.n = ngx; gu.xq = P.Xq; gu.bounds = bounds;
                 gu.ids = P.mmq_identity; gu.total_rows = one_tile_exact ? (int64_t)n * 8 : nr;
                 gu.max_rows = max_rows; gu.dst = P.gu; gu.ld_dst = 2 * kFF;
+                if (P.row_profile && ip == group.pass_begin) CUDA_CHECK(cudaEventRecord(P.rb_group[g][1], s));
                 P.mmq->run(gu, s);
+                if (P.row_profile && ip == group.pass_begin) CUDA_CHECK(cudaEventRecord(P.rb_group[g][2], s));
                 strata::prefill::mmq::swiglu(P.gu + (one_tile_exact ? (size_t)r0 * 2 * kFF : 0),
                                              mmq_h + (one_tile_exact ? (size_t)r0 * kFF : 0), nr, kFF, false, s);
                 strata::prefill::mmq::quantize(mmq_h + (one_tile_exact ? (size_t)r0 * kFF : 0), nullptr,
@@ -2060,7 +2131,9 @@ void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_
                 down.dst = ordered_combine ? full_moe + (size_t)r0 * kE :
                                              P.moe + (one_tile_exact ? (size_t)r0 * kE : 0);
                 down.ld_dst = kE;
+                if (P.row_profile && ip == group.pass_begin) CUDA_CHECK(cudaEventRecord(P.rb_group[g][3], s));
                 P.mmq->run(down, s);
+                if (P.row_profile && ip == group.pass_begin) CUDA_CHECK(cudaEventRecord(P.rb_group[g][4], s));
                 if (!ordered_combine && !one_tile_exact)
                     routed_group_add_kernel<<<n, 256, 0, s>>>(full_acc, P.moe, d_inv, full_w, n, r0, r1);
             }
@@ -2081,6 +2154,30 @@ void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_
         if (profile) CUDA_CHECK(cudaEventRecord(profile->phase[4], s));
         const double layer_sync_start = profile ? now_ms() : 0;
         CUDA_CHECK(cudaStreamSynchronize(s));
+        if (P.row_profile) {
+            // Read after the existing layer fence, before the next layer reuses these events.
+            auto span = [](cudaEvent_t a, cudaEvent_t b, double& dst) {
+                float ms = 0;
+                if (a && b && cudaEventElapsedTime(&ms, a, b) == cudaSuccess) dst += ms;
+            };
+            for (size_t g = 0; g < groups.size(); ++g) {
+                const int b = gbucket[g];
+                ++P.rb_groups[b];
+                span(P.rb_group[g][0], P.rb_group[g][1], P.rb_prep[b]);
+                span(P.rb_group[g][1], P.rb_group[g][2], P.rb_gu[b]);
+                span(P.rb_group[g][3], P.rb_group[g][4], P.rb_down[b]);
+                if (P.group_prefetch) span(P.rb_wait_ev[g][0], P.rb_wait_ev[g][1], P.rb_wait[b]);
+            }
+            for (size_t j = 0; j < order.size(); ++j) {
+                const int b = routed_row_bucket(row_of[j]);
+                ++P.rb_experts[b];
+                P.rb_rows[b] += (uint64_t)row_of[j];
+                if (stage_of[j] >= 0 && !P.group_prefetch) {
+                    span(P.rb_wait_ev[j][0], P.rb_wait_ev[j][1], P.rb_wait[b]);
+                    span(P.rb_cwait_ev[j][0], P.rb_cwait_ev[j][1], P.rb_ring[b]);
+                }
+            }
+        }
         if (profile) {
             const double layer_host_end = now_ms();
             int copies = 0;

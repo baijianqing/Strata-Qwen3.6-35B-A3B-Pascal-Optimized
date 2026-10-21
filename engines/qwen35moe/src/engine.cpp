@@ -636,7 +636,14 @@ void Engine::setup_cache() {
                     }
                 }
                 have_profile = true;
-                log("expert profile: %s", opt_.profile_path.c_str());
+                uint32_t id = 2166136261u;   // identify the exact prior used by a run
+                for (float value : fr) {
+                    uint32_t bits = 0;
+                    std::memcpy(&bits, &value, sizeof(bits));
+                    id = (id ^ bits) * 16777619u;
+                }
+                profile_id_ = id;
+                log("expert profile: %s (id %08x)", opt_.profile_path.c_str(), id);
             }
         }
         if (!have_profile) log("expert profile %s not usable; starting from a uniform cache", opt_.profile_path.c_str());
@@ -2162,6 +2169,12 @@ void Engine::feed(const int* tokens, int n) {
         }
         ~PromptScope() { head = previous_head; snapshots = previous_snapshots; }
     };
+    auto note_path = [&](const char* path, int tile) {
+        if (phase_switch_profile_) log("PREFILL_PATH_SLICE n=%d path=%s tile=%d", n, path, tile);
+        if (last_prefill_path_.empty()) last_prefill_path_ = path;
+        else if (last_prefill_path_ != path) last_prefill_path_ = "mixed";
+        last_prefill_tile_ = std::max(last_prefill_tile_, tile);
+    };
     if (prefill_phase_switch_ && opt_.prefill_chunk > 0 && n >= phase_switch_min_) {
         const double t0 = now_ms();
         PhaseSwitchTiming pt;
@@ -2192,6 +2205,7 @@ void Engine::feed(const int* tokens, int n) {
             // Elsewhere (CPU LM head, larger models) fall back to the full borrow path.
             if (free_now >= (size_t)448 * 1048576) {
                 const int tile = ((n + 127) / 128) * 128;
+                note_path("short", tile);
                 prefill_ = std::make_unique<Prefill>(*this);
                 std::string prefill_error;
                 SQ_CHECK(prefill_->init(prefill_error, tile),
@@ -2256,6 +2270,7 @@ void Engine::feed(const int* tokens, int n) {
         prefill_ = std::make_unique<Prefill>(*this);
         std::string prefill_error;
         SQ_CHECK(prefill_->init(prefill_error), "phase-switched prefill initialization failed: %s", prefill_error.c_str());
+        note_path("borrowed", prefill_->tile());
         mark(pt.init_ms);   // workspace allocation + per-prompt MMQ packing
         prefill_->run(tokens, n);
         mark(pt.run_ms);
@@ -2298,6 +2313,9 @@ void Engine::feed(const int* tokens, int n) {
         prompt_batch = v[0] - '0';
     }
     if (prompt_batch > 1) {
+        // n < phase_switch_min_ is a generated token fed by spec_step, not a prompt slice: do not let it
+        // rewrite the request's effective path record.
+        if (n >= phase_switch_min_) note_path("batch", 0);
         SQ_CHECK(event_moe_ && !sync_moe_,
                  "STRATA_PROMPT_BATCH>1 requires STRATA_EVENT_MOE=1 and STRATA_SYNC_MOE=0");
         // An MTP engine allocates rollback snapshots for its configured verification window (drafts + 1).
@@ -2362,6 +2380,7 @@ void Engine::feed(const int* tokens, int n) {
         return;
     }
     if (n >= opt_.prefill_min && prefill_ && prefill_->ready()) {
+        note_path("prefill", prefill_->tile());
         const double t0 = now_ms();
         prefill_->run(tokens, n);   // also runs the MTP layer over the new positions (and leaves one pair pending)
         stats.prefill_ms += now_ms() - t0;
@@ -2372,6 +2391,7 @@ void Engine::feed(const int* tokens, int n) {
         if (opt_.adapt_every > 0 && cache_slots_total_ > 0) adapt_cache();
         return;
     }
+    if (n >= phase_switch_min_) note_path("decode", 0);
     for (int i = 0; i < n; ++i) {
         PromptScope prompt_scope(skip_trunk_head_, skip_prompt_snapshots_,
                                  prompt_skip_head_ && i + 1 < n, prompt_no_snapshots_);
