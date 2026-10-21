@@ -63,6 +63,14 @@ RATE_WINDOW_S = 2.0
 RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean so far, with the span floored here
 
 
+def after_stop_continues(tok, ids: list[int], stop_ids) -> bool:
+    """Only plain thinking at a complete character boundary can precede the budget's wrap-up."""
+    if not ids or any(t in stop_ids for t in ids):
+        return False
+    text = tok.decode(ids)
+    return "<" not in text and "\ufffd" not in text
+
+
 # ------------------------------------------------------------------------------------------------ engines
 class Engine(Protocol):
     max_context: int
@@ -349,6 +357,8 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         self.progress = None
         self.prefill_tok_s_mean = None
+        # STOP may land after more tokens were emitted; the live session holds all emitted ids but the last.
+        self.after_stop: list[int] = []
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -404,6 +414,11 @@ class StrataEngine:
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
+                    if line.startswith("T "):
+                        try:
+                            self.after_stop.append(int(line[2:]))
+                        except ValueError:
+                            pass
 
     def close(self):
         try:
@@ -1104,6 +1119,20 @@ class Service:
                         extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
+                        # Keep safe in-flight tokens by id, or the continuation ceases to contain the live session.
+                        # Tags, stop ids and split characters retain the old cut rather than changing parser state.
+                        after = list(getattr(self.engine, "after_stop", None) or [])
+                        if (len(after) < max_new - n - len(extra)
+                                and after_stop_continues(self.tok, after, self.stop_ids)):
+                            for t in after:
+                                n += 1
+                                raw_ids.append(t)
+                                seg.append(t)
+                                thought += 1
+                                evs = parser.feed(detok.push(t))
+                                self._note(n, evs)
+                                for ev in evs:
+                                    yield "event", ev
                         print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                               flush=True)
                         for t in extra:
