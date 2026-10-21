@@ -1304,6 +1304,241 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(self.engine.prompts, [])
 
 
+class OvershootEngine(ThinkingEngine):
+    """Models tokens emitted in flight after STOP; the live session holds all emitted ids but the last."""
+    OVER = 3
+
+    def __init__(self, tok):
+        super().__init__(tok)
+        self.emitted, self.sessions, self.limits = [], [], []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.after_stop = []
+        self.prompts.append(list(ids))
+        self.limits.append(max_new)
+        done = self.tok.decode(ids).endswith("</think>\n\n")
+        text = self.ANSWER if done else self.THOUGHT + "</think>\n\n" + self.ANSWER
+        toks = (self.tok.encode(text, parse_special=True) +
+                self.tok.encode("<|im_end|>", parse_special=True))[:max_new]
+        emitted = []
+        try:
+            for t in toks:
+                if cancel.is_set():
+                    return
+                emitted.append(t)
+                yield t
+        except GeneratorExit:
+            self.after_stop = toks[len(emitted):len(emitted) + self.OVER]
+            emitted.extend(self.after_stop)
+            raise
+        finally:
+            self.emitted.append(emitted)
+            self.sessions.append(list(ids) + emitted[:-1])
+
+
+class IncrementalByteTokenizer(ByteTokenizer):
+    def token_bytes(self, t):
+        return self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t])
+
+
+class ThinkingBudgetAfterStop(unittest.TestCase):
+    post, openai = ThinkingBudget.post, ThinkingBudget.openai
+
+    def setUp(self):
+        self.start()
+
+    def start(self, tok=None):
+        self.tok = tok or ByteTokenizer()
+        self.engine = OvershootEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def run_budget(self, budget=20, max_new=400, prompt=None, thinking=True):
+        ids = self.tok.encode("prompt") if prompt is None else prompt
+        req = {} if budget is None else {"reasoning_budget_tokens": budget}
+        out = list(self.svc.run(ids, thinking, None, max_new, req, threading.Event()))
+        reasoning = "".join(ev.text for kind, ev in out if kind == "event" and ev.kind == "reasoning")
+        content = "".join(ev.text for kind, ev in out if kind == "event" and ev.kind == "content")
+        self.assertEqual(out[-1][0], "done")
+        return reasoning, content, out[-1][1]
+
+    def test_safe_overshoot_preserves_the_exact_session_prefix(self):
+        from serve.server import REASONING_WRAP_UP
+        for over in (0, 1, 3, 6):
+            with self.subTest(over=over):
+                self.start()
+                self.engine.OVER = over
+                self.engine.max_context = 40000
+                prompt = self.tok.encode("p" * 25000)
+                reasoning, content, done = self.run_budget(prompt=prompt)
+                kept = self.engine.THOUGHT[:20 + over]
+                extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+                first, second = self.engine.prompts
+                self.assertEqual(reasoning, kept + REASONING_WRAP_UP.split("</think>")[0])
+                self.assertEqual(content, self.engine.ANSWER)
+                self.assertEqual(second, first + self.engine.emitted[0] + extra)
+                session = self.engine.sessions[0]
+                self.assertEqual(second[:len(session)], session)
+                self.assertEqual(len(second) - len(session), len(extra) + 1)
+                self.assertEqual(self.engine.limits[1], 400 - len(kept) - len(extra))
+                self.assertEqual(done["completion_tokens"], len(kept) + len(extra) + len(content) + 1)
+                self.assertEqual(done["finish"], "stop")
+                self.assertEqual(self.svc.history[-1]["output_tokens"], done["completion_tokens"])
+
+    def test_tags_specials_and_incomplete_characters_keep_the_old_cut(self):
+        from serve.server import REASONING_WRAP_UP
+        for suffix, over in (("</think>answer", 9), ("<tool_call>", 3), ("<b>", 3),
+                             ("<|im_start|>", 1), ("<|im_end|>", 1), ("<|endoftext|>", 1),
+                             ("é more", 1)):
+            with self.subTest(suffix=suffix):
+                self.start()
+                self.engine.THOUGHT = "a" * 20 + suffix + " more thoughts"
+                self.engine.OVER = over
+                reasoning, content, done = self.run_budget()
+                self.assertEqual(reasoning, "a" * 20 + REASONING_WRAP_UP.split("</think>")[0])
+                self.assertEqual(content, self.engine.ANSWER)
+                first, second = self.engine.prompts
+                self.assertEqual(second, first + self.tok.encode("a" * 20) +
+                                 self.tok.encode(REASONING_WRAP_UP, parse_special=True))
+                self.assertEqual(done["finish"], "stop")
+
+    def test_complete_multibyte_overshoot_is_kept(self):
+        from serve.server import REASONING_WRAP_UP
+        for tok in (ByteTokenizer(), IncrementalByteTokenizer()):
+            with self.subTest(tokenizer=type(tok).__name__):
+                self.start(tok)
+                self.engine.THOUGHT = "a" * 20 + "你 more thinking"
+                reasoning, _, _ = self.run_budget()
+                self.assertEqual(reasoning, "a" * 20 + "你" + REASONING_WRAP_UP.split("</think>")[0])
+                self.assertEqual(self.engine.prompts[1], self.engine.prompts[0] + self.engine.emitted[0] +
+                                 self.tok.encode(REASONING_WRAP_UP, parse_special=True))
+
+    def test_budget_waits_for_a_clean_character_boundary(self):
+        from serve.server import REASONING_WRAP_UP
+        for tok in (ByteTokenizer(), IncrementalByteTokenizer()):
+            with self.subTest(tokenizer=type(tok).__name__):
+                self.start(tok)
+                self.engine.THOUGHT = "a" * 19 + "é more thinking"
+                reasoning, _, _ = self.run_budget()
+                self.assertEqual(reasoning, "a" * 19 + "é mo" + REASONING_WRAP_UP.split("</think>")[0])
+                self.assertEqual(self.engine.prompts[1], self.engine.prompts[0] + self.engine.emitted[0] +
+                                 self.tok.encode(REASONING_WRAP_UP, parse_special=True))
+
+    def test_overshoot_must_leave_room_for_wrap_up_and_an_answer(self):
+        from serve.server import REASONING_WRAP_UP
+        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+        limit = 20 + len(extra) + self.engine.OVER
+        reasoning, content, done = self.run_budget(max_new=limit)
+        self.assertEqual(reasoning, self.engine.THOUGHT[:20] + REASONING_WRAP_UP.split("</think>")[0])
+        self.assertEqual(content, self.engine.ANSWER[:self.engine.OVER])
+        self.assertEqual(done["completion_tokens"], limit)
+        self.assertEqual(done["finish"], "length")
+
+    def test_without_room_for_wrap_up_no_continuation_is_sent(self):
+        reasoning, content, done = self.run_budget(max_new=40)
+        self.assertEqual((reasoning, content), (self.engine.THOUGHT[:20], ""))
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(done["finish"], "length")
+
+    def test_no_budget_or_unreached_budget_is_unchanged(self):
+        for budget in (None, 0, 10000):
+            with self.subTest(budget=budget):
+                self.start()
+                self.engine.after_stop = self.tok.encode("stale tokens")
+                reasoning, content, done = self.run_budget(budget=budget)
+                self.assertEqual((reasoning, content), (self.engine.THOUGHT, self.engine.ANSWER))
+                self.assertEqual(len(self.engine.prompts), 1)
+                self.assertEqual(done["finish"], "stop")
+                self.assertEqual(self.engine.after_stop, [])
+
+    def test_openai_and_anthropic_stream_include_the_kept_tokens(self):
+        from serve.server import REASONING_WRAP_UP
+        httpd = serve(self.svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        code, body = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, body)
+        expected = self.engine.THOUGHT[:23] + REASONING_WRAP_UP.split("</think>")[0]
+        self.assertEqual(body["choices"][0]["message"]["reasoning_content"], expected)
+        code, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 400, "stream": True,
+                                             "reasoning_budget_tokens": 20,
+                                             "messages": [{"role": "user", "content": "2+2?"}]})
+        self.assertEqual(code, 200)
+        evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        reasoning = "".join(e["delta"].get("thinking", "") for e in evs if e["type"] == "content_block_delta")
+        content = "".join(e["delta"].get("text", "") for e in evs if e["type"] == "content_block_delta")
+        self.assertEqual(reasoning, expected)
+        self.assertEqual(content, self.engine.ANSWER)
+        self.assertEqual(evs[-2]["delta"]["stop_reason"], "end_turn")
+        self.assertEqual(evs[-2]["usage"]["output_tokens"], body["usage"]["completion_tokens"])
+
+    def test_after_stop_continues(self):
+        from serve.server import after_stop_continues
+        for text, safe in ((" two", True), ("你é", True), ("", False), ("</think>", False),
+                           ("<tool_call>", False), ("<|im_start|>", False), (" a<|im_end|>", False),
+                           ("<|endoftext|>", False), ("�", False)):
+            with self.subTest(text=text):
+                self.assertEqual(after_stop_continues(self.tok, self.tok.encode(text, parse_special=True),
+                                                     self.svc.stop_ids), safe)
+        self.assertFalse(after_stop_continues(self.tok, self.tok.encode("é")[:1], self.svc.stop_ids))
+
+
+class StrataAfterStop(unittest.TestCase):
+    def engine(self, lines):
+        import io
+        import queue
+        from types import SimpleNamespace
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)
+        engine.lines = queue.Queue()
+        engine.can_stop = True
+        engine.max_context = CTX
+        for line in lines:
+            engine.lines.put(line)
+        return engine
+
+    def test_drain_records_tokens_until_done_and_resets_on_next_request(self):
+        engine = self.engine(["T 10", "T 11", "PP 1 1", "T bad", "T 12",
+                              "DONE 3 1 2 3 cancel 0 0 0", "T 20", "DONE 1 1 0 1 stop 0 0 0"])
+        gen = engine.generate([1], 20, {}, threading.Event())
+        self.assertEqual(next(gen), 10)
+        gen.close()
+        self.assertEqual(engine.after_stop, [11, 12])
+        self.assertEqual(engine.last["finish"], "cancel")
+        self.assertEqual(engine.proc.stdin.getvalue().count("STOP\n"), 1)
+        gen = engine.generate([2], 20, {}, threading.Event())
+        self.assertEqual(next(gen), 20)
+        self.assertEqual(engine.after_stop, [])
+        self.assertEqual(list(gen), [])
+        self.assertEqual(engine.after_stop, [])
+        self.assertTrue(engine.lines.empty())
+
+    def test_service_continuation_keeps_ids_without_retokenizing(self):
+        from serve.server import REASONING_WRAP_UP
+
+        class AliasTokenizer(ByteTokenizer):
+            def decode(self, ids, errors="replace"):
+                expanded = [b for t in ids for b in ([98, 99] if t == 512 else [t])]
+                return super().decode(expanded, errors=errors)
+
+        tok = AliasTokenizer()
+        emitted = tok.encode("a" * 20) + [512, 100, 101]   # 512 decodes to 'bc', but encode('bc') != [512]
+        answer = tok.encode(ThinkingEngine.ANSWER) + tok.encode("<|im_end|>", parse_special=True)
+        engine = self.engine([*(f"T {t}" for t in emitted), "DONE 23 1 0 1 cancel 0 0 0",
+                              *(f"T {t}" for t in answer), "DONE 16 1 0 1 stop 0 0 0"])
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        out = list(svc.run([1], True, None, 400, {"reasoning_budget_tokens": 20}, threading.Event()))
+        prompts = [list(map(int, line.split()[-1].split(",")))
+                   for line in engine.proc.stdin.getvalue().splitlines() if line.startswith("GEN ")]
+        extra = tok.encode(REASONING_WRAP_UP, parse_special=True)
+        self.assertEqual(prompts[1], prompts[0] + emitted + extra)
+        self.assertNotEqual(tok.encode(tok.decode(emitted)), emitted)
+        reasoning = "".join(ev.text for kind, ev in out if kind == "event" and ev.kind == "reasoning")
+        self.assertEqual(reasoning, "a" * 20 + "bcde" + REASONING_WRAP_UP.split("</think>")[0])
+        self.assertEqual(out[-1][1]["completion_tokens"], 23 + len(extra) + len(answer))
+        self.assertTrue(engine.lines.empty())
+
+
 class StatusHandover(unittest.TestCase):
     """#266: a stream aborted mid-way and the next request, which was waiting for the fifo.  The aborted request's
     status/history block ran after the fifo was released, so the waiting request could start in that gap: the old
