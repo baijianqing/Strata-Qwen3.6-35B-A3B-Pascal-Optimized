@@ -395,18 +395,18 @@ const float* Model::upload_vec(const GgufTensor& t) {
     return w;
 }
 
-bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
+bool Model::load(const std::string& path, const std::string& mtp_path, bool with_mtp, std::string& err) {
     const double t0 = now_ms();
+    mtp_sidecar_ = false;
     const char* fast_env = std::getenv("STRATA_EXPERT_CONVERSION_FAST");
     fast_expert_conversion_ = fast_env && std::string(fast_env) == "1";
     if (!gguf.open(path, err)) return false;
     const std::string arch = gguf.str("general.architecture");
     if (arch != "qwen35moe") { err = "unsupported architecture '" + arch + "' (this engine runs qwen35moe only)"; return false; }
     Config& c = cfg;
-    c.n_layer = (int)gguf.i64("qwen35moe.block_count");
-    const int nextn = (int)gguf.num("qwen35moe.nextn_predict_layers", 0);
-    c.n_layer -= nextn;   // the MTP blocks come after the main layers
-    c.n_mtp = with_mtp && nextn > 0 && gguf.tensor(blk(c.n_layer, "nextn.eh_proj.weight")) ? 1 : 0;
+    const int main_blocks = (int)gguf.i64("qwen35moe.block_count");
+    const int main_nextn = (int)gguf.num("qwen35moe.nextn_predict_layers", 0);
+    c.n_layer = main_blocks - main_nextn;   // the MTP blocks come after the main layers
     c.n_embd = (int)gguf.i64("qwen35moe.embedding_length");
     c.n_head = (int)gguf.i64("qwen35moe.attention.head_count");
     c.n_head_kv = (int)gguf.i64("qwen35moe.attention.head_count_kv");
@@ -427,6 +427,43 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     c.ctx_train = (int)gguf.num("qwen35moe.context_length", 262144);
     const GgufTensor& te = gguf.need("token_embd.weight");
     c.n_vocab = (int)te.ne[1];
+
+    // The MTP block can come from the same file or from a second GGUF of the same family.  The latter lets a
+    // fine-tune without nextn weights (MiniCPM-V 4.7) borrow Qwen3.6's MTP head while keeping its own
+    // embedding, LM head and 40 main layers.
+    c.n_mtp = 0;
+    if (with_mtp) {
+        if (main_nextn > 0 && gguf.tensor(blk(c.n_layer, "nextn.eh_proj.weight"))) {
+            c.n_mtp = 1;
+        } else if (!mtp_path.empty()) {
+            if (!mtp_gguf.open(mtp_path, err)) return false;
+            const int side_blocks = (int)mtp_gguf.i64("qwen35moe.block_count");
+            const int side_nextn = (int)mtp_gguf.num("qwen35moe.nextn_predict_layers", 0);
+            const bool compatible = side_nextn > 0 && side_blocks - side_nextn == c.n_layer &&
+                (int)mtp_gguf.i64("qwen35moe.embedding_length") == c.n_embd &&
+                (int)mtp_gguf.i64("qwen35moe.attention.head_count") == c.n_head &&
+                (int)mtp_gguf.i64("qwen35moe.expert_count") == c.n_expert &&
+                mtp_gguf.tensor(blk(c.n_layer, "nextn.eh_proj.weight")) != nullptr;
+            if (!compatible) {
+                err = "MTP sidecar '" + mtp_path + "' has no compatible MTP block for layer " +
+                      std::to_string(c.n_layer);
+                return false;
+            }
+            mtp_sidecar_ = true;
+            c.n_mtp = 1;
+            log("MTP sidecar: %s (layer %d)", mtp_path.c_str(), c.n_layer);
+        }
+    }
+    // MTP tensors come from the sidecar when it supplied the block; every main-layer tensor stays in `gguf`.
+    auto src_tensor = [&](int il, const char* name) -> const GgufTensor* {
+        const std::string full = blk(il, name);
+        return (mtp_sidecar_ && il >= c.n_layer) ? mtp_gguf.tensor(full) : gguf.tensor(full);
+    };
+    auto src_need = [&](int il, const char* name) -> const GgufTensor& {
+        const GgufTensor* t = src_tensor(il, name);
+        SQ_CHECK(t != nullptr, "missing tensor %s", blk(il, name).c_str());
+        return *t;
+    };
 
     // The kernels are written for this model's shapes; refuse anything else rather than mis-index.
     SQ_CHECK(c.n_embd == 2048 && c.head_dim == 256 && c.n_head == 16 && c.n_head_kv == 2 && c.n_rot == 64 &&
@@ -457,26 +494,26 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     for (int il = 0; il < c.n_moe_layers(); ++il) {
         f32(c.n_embd); f32(c.n_embd);
         if (c.is_attn(il)) {
-            q8({&gguf.need(blk(il, "attn_q.weight")), &gguf.need(blk(il, "attn_k.weight")),
-                &gguf.need(blk(il, "attn_v.weight"))});
+            q8({&src_need(il,"attn_q.weight"), &src_need(il,"attn_k.weight"),
+                &src_need(il,"attn_v.weight")});
             f32(c.head_dim); f32(c.head_dim);
-            q8({&gguf.need(blk(il, "attn_output.weight"))});
+            q8({&src_need(il,"attn_output.weight")});
         } else {
-            q8({&gguf.need(blk(il, "attn_qkv.weight")), &gguf.need(blk(il, "attn_gate.weight"))});
+            q8({&src_need(il,"attn_qkv.weight"), &src_need(il,"attn_gate.weight")});
             f32(2 * c.ssm_n_vh * c.n_embd);
             f32(c.conv_dim() * c.ssm_d_conv); f32(c.ssm_n_vh); f32(c.ssm_n_vh); f32(c.ssm_d_state);
-            q8({&gguf.need(blk(il, "ssm_out.weight"))});
+            q8({&src_need(il,"ssm_out.weight")});
         }
         f32((c.n_expert + 1) * c.n_embd);
-        q8({&gguf.need(blk(il, "ffn_gate_shexp.weight")), &gguf.need(blk(il, "ffn_up_shexp.weight"))});
-        q8({&gguf.need(blk(il, "ffn_down_shexp.weight"))});
+        q8({&src_need(il,"ffn_gate_shexp.weight"), &src_need(il,"ffn_up_shexp.weight")});
+        q8({&src_need(il,"ffn_down_shexp.weight")});
     }
     f32(c.n_embd);
     const GgufTensor* output = gguf.tensor("output.weight");
     if (!cpu_lm_head && !phase_lm_head) q8({output ? output : &te});
     if (c.n_mtp) {
         f32(c.n_embd); f32(c.n_embd); f32(c.n_embd);
-        q8({&gguf.need(blk(c.n_layer, "nextn.eh_proj.weight"))});
+        q8({&src_need(c.n_layer,"nextn.eh_proj.weight")});
     }
     dev_cap_ = need + (1 << 20);
     CUDA_CHECK(cudaMalloc(&dev_arena_, dev_cap_));
@@ -493,28 +530,28 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     for (int il = 0; il < c.n_moe_layers(); ++il) {
         LayerW& L = layers[il];
         L.attn = c.is_attn(il);
-        L.attn_norm = upload_vec(gguf.need(blk(il, "attn_norm.weight")));
-        L.post_norm = upload_vec(gguf.need(blk(il, "post_attention_norm.weight")));
+        L.attn_norm = upload_vec(src_need(il,"attn_norm.weight"));
+        L.post_norm = upload_vec(src_need(il,"post_attention_norm.weight"));
         if (L.attn) {
-            L.qkv = upload_q8({&gguf.need(blk(il, "attn_q.weight")), &gguf.need(blk(il, "attn_k.weight")),
-                               &gguf.need(blk(il, "attn_v.weight"))});
-            L.q_norm = upload_vec(gguf.need(blk(il, "attn_q_norm.weight")));
-            L.k_norm = upload_vec(gguf.need(blk(il, "attn_k_norm.weight")));
-            L.wo = upload_q8({&gguf.need(blk(il, "attn_output.weight"))});
+            L.qkv = upload_q8({&src_need(il,"attn_q.weight"), &src_need(il,"attn_k.weight"),
+                               &src_need(il,"attn_v.weight")});
+            L.q_norm = upload_vec(src_need(il,"attn_q_norm.weight"));
+            L.k_norm = upload_vec(src_need(il,"attn_k_norm.weight"));
+            L.wo = upload_q8({&src_need(il,"attn_output.weight")});
         } else {
-            L.qkvz = upload_q8({&gguf.need(blk(il, "attn_qkv.weight")), &gguf.need(blk(il, "attn_gate.weight"))});
+            L.qkvz = upload_q8({&src_need(il,"attn_qkv.weight"), &src_need(il,"attn_gate.weight")});
             // Fused as one 64 x n_embd f32 matrix.  Qwen3.6 stores both BF16 and MiniCPM-V 4.7 stores both
             // Q8_0; `upload_f32` dequantizes either form, so the kernels always see f32.
-            L.ba = upload_f32({&gguf.need(blk(il, "ssm_beta.weight")), &gguf.need(blk(il, "ssm_alpha.weight"))});
-            L.conv_w = upload_vec(gguf.need(blk(il, "ssm_conv1d.weight")));
-            L.dt_bias = upload_vec(gguf.need(blk(il, "ssm_dt.bias")));
-            L.ssm_a = upload_vec(gguf.need(blk(il, "ssm_a")));
-            L.ssm_norm = upload_vec(gguf.need(blk(il, "ssm_norm.weight")));
-            L.ssm_out = upload_q8({&gguf.need(blk(il, "ssm_out.weight"))});
+            L.ba = upload_f32({&src_need(il,"ssm_beta.weight"), &src_need(il,"ssm_alpha.weight")});
+            L.conv_w = upload_vec(src_need(il,"ssm_conv1d.weight"));
+            L.dt_bias = upload_vec(src_need(il,"ssm_dt.bias"));
+            L.ssm_a = upload_vec(src_need(il,"ssm_a"));
+            L.ssm_norm = upload_vec(src_need(il,"ssm_norm.weight"));
+            L.ssm_out = upload_q8({&src_need(il,"ssm_out.weight")});
         }
-        L.router = upload_f32({&gguf.need(blk(il, "ffn_gate_inp.weight")), &gguf.need(blk(il, "ffn_gate_inp_shexp.weight"))});
-        L.sh_gu = upload_q8({&gguf.need(blk(il, "ffn_gate_shexp.weight")), &gguf.need(blk(il, "ffn_up_shexp.weight"))});
-        L.sh_down = upload_q8({&gguf.need(blk(il, "ffn_down_shexp.weight"))});
+        L.router = upload_f32({&src_need(il,"ffn_gate_inp.weight"), &src_need(il,"ffn_gate_inp_shexp.weight")});
+        L.sh_gu = upload_q8({&src_need(il,"ffn_gate_shexp.weight"), &src_need(il,"ffn_up_shexp.weight")});
+        L.sh_down = upload_q8({&src_need(il,"ffn_down_shexp.weight")});
     }
     output_norm = upload_vec(gguf.need("output_norm.weight"));
     const GgufTensor* out = gguf.tensor("output.weight");
@@ -528,13 +565,13 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     if (cpu_lm_head) log("LM head: Q8_0 in host RAM (STRATA_CPU_LM_HEAD=1)");
     if (c.n_mtp) {
         const int il = c.n_layer;
-        mtp.enorm = upload_vec(gguf.need(blk(il, "nextn.enorm.weight")));
-        mtp.hnorm = upload_vec(gguf.need(blk(il, "nextn.hnorm.weight")));
-        const GgufTensor* hn = gguf.tensor(blk(il, "nextn.shared_head_norm.weight"));
+        mtp.enorm = upload_vec(src_need(il,"nextn.enorm.weight"));
+        mtp.hnorm = upload_vec(src_need(il,"nextn.hnorm.weight"));
+        const GgufTensor* hn = src_tensor(il,"nextn.shared_head_norm.weight");
         mtp.head_norm = hn ? upload_vec(*hn) : output_norm;
-        mtp.eh_proj = upload_q8({&gguf.need(blk(il, "nextn.eh_proj.weight"))});
+        mtp.eh_proj = upload_q8({&src_need(il,"nextn.eh_proj.weight")});
         SQ_CHECK(mtp.eh_proj.rows == c.n_embd && mtp.eh_proj.cols == 2 * c.n_embd, "MTP eh_proj shape");
-        SQ_CHECK(!gguf.tensor(blk(il, "nextn.embed_tokens.weight")) && !gguf.tensor(blk(il, "nextn.shared_head_head.weight")),
+        SQ_CHECK(!src_tensor(il,"nextn.embed_tokens.weight") && !src_tensor(il,"nextn.shared_head_head.weight"),
                  "MTP block with its own embedding / head is not supported");
         log("MTP block loaded (layer %d)", il);
     }
@@ -559,16 +596,16 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     };
     const bool native_any = [&] {
         for (int il = 0; il < c.n_moe_layers(); ++il)
-            if (native_supported(gguf.need(blk(il, "ffn_gate_exps.weight")).type) &&
-                native_supported(gguf.need(blk(il, "ffn_down_exps.weight")).type))
+            if (native_supported(src_need(il,"ffn_gate_exps.weight").type) &&
+                native_supported(src_need(il,"ffn_down_exps.weight").type))
                 return true;
         return false;
     }();
     for (int il = 0; il < c.n_moe_layers(); ++il) {
         LayerW& L = layers[il];
-        const GgufTensor& g = gguf.need(blk(il, "ffn_gate_exps.weight"));
-        const GgufTensor& u = gguf.need(blk(il, "ffn_up_exps.weight"));
-        const GgufTensor& d = gguf.need(blk(il, "ffn_down_exps.weight"));
+        const GgufTensor& g = src_need(il,"ffn_gate_exps.weight");
+        const GgufTensor& u = src_need(il,"ffn_up_exps.weight");
+        const GgufTensor& d = src_need(il,"ffn_down_exps.weight");
         SQ_CHECK(g.type == u.type, "layer %d: gate/up types differ", il);
         for (uint32_t t : {g.type, d.type})
             SQ_CHECK(can_dequant(t), "layer %d: unsupported expert import type %s", il, type_name(t));
@@ -583,6 +620,8 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     // "expert arena:" and "loaded ... GiB at" are what serve/server.py narrates while the engine starts
     const char* cache_path = std::getenv("STRATA_EXPERT_CACHE_FILE");
     const bool mapped_cache = cache_path && *cache_path;
+    if (mapped_cache && mtp_sidecar_)
+        log("warning: expert cache identity covers only the main GGUF; use a fresh file when the MTP sidecar changes");
     int completed_layers = 0;
     if (native_any) log("expert storage: native packed weights (IQ2_S/IQ3_S/IQ4_XS/Q2_K/Q3_K/K-quants); no requantization");
     else log("expert storage: legacy K-quants; fallback Q6_K %s",
@@ -631,9 +670,9 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     // The source GGUF is read-only. A flushed completion marker makes interrupted cache creation resumable.
     for (int il = completed_layers; il < c.n_moe_layers(); ++il) {
         LayerW& L = layers[il];
-        const GgufTensor& g = gguf.need(blk(il, "ffn_gate_exps.weight"));
-        const GgufTensor& u = gguf.need(blk(il, "ffn_up_exps.weight"));
-        const GgufTensor& d = gguf.need(blk(il, "ffn_down_exps.weight"));
+        const GgufTensor& g = src_need(il,"ffn_gate_exps.weight");
+        const GgufTensor& u = src_need(il,"ffn_up_exps.weight");
+        const GgufTensor& d = src_need(il,"ffn_down_exps.weight");
         const double layer_start = now_ms();
         log("expert layer %d/%d: %s/%s -> %s/%s", il + 1, c.n_moe_layers(),
             type_name(g.type), type_name(d.type), type_name(L.t_gu), type_name(L.t_down));
@@ -667,6 +706,7 @@ bool Model::load(const std::string& path, bool with_mtp, std::string& err) {
     tok_embd_copy_.assign(emb.data, emb.data + (size_t)tok_embd_row_bytes * c.n_vocab);
     tok_embd = tok_embd_copy_.data();
     gguf.close();
+    if (mtp_sidecar_) mtp_gguf.close();
     const double secs = (now_ms() - t1) / 1000;
     log("experts loaded %.2f GiB at %.1f GiB/s (%.1f s)", expert_bytes / 1073741824.0,
         secs > 0 ? expert_bytes / 1073741824.0 / secs : 0.0, secs);

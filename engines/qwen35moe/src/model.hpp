@@ -123,13 +123,17 @@ public:
     int64_t expert_bytes = 0;   // pinned host bytes of experts
 
     /// with_mtp: load the MTP block when the file has one.
-    bool load(const std::string& path, bool with_mtp, std::string& err);
+    /// `mtp_path` optionally supplies the MTP block (blk.<n_layer>.nextn.* and its layer weights) from a
+    /// second GGUF of the same family; the main weights, embedding and LM head stay in `path`.
+    bool load(const std::string& path, const std::string& mtp_path, bool with_mtp, std::string& err);
     int64_t release_lm_head();  // returns device bytes lent; valid only when phase_lm_head is enabled
     void restore_lm_head();
     void embed(int token, float* out) const;   // dequantize one embedding row (host)
     ~Model();
 
     GgufFile gguf;
+    GgufFile mtp_gguf;              // optional sidecar holding the MTP layer when the main GGUF has none
+    bool mtp_sidecar_ = false;
 
 private:
     uint8_t* dev_arena_ = nullptr;

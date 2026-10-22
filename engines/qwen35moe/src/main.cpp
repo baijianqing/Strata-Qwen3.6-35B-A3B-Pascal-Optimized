@@ -90,6 +90,7 @@ void usage() {
         "  --profile-weight W weight of the profile against live routing (default 1)\n"
         "  --prefill-chunk N  tokens per prefill pass (default 4096; 0 = decode-only, saves VRAM)\n"
         "  --ckpt-slots N     prefix-reuse checkpoints (default 3, ~66 MiB each; 0 = disabled)\n"
+        "  --mtp-model FILE   take the MTP block from another GGUF of this family (main weights stay in -m)\n"
         "  --mtp-draft N      speculative decoding: up to N tokens drafted per step by the MTP block (default 3,\n"
         "                     max 3; 0 = off and the MTP block is not loaded; also --mtp)\n"
         "  --draft-p P        keep drafting while the MTP's probability of the drafts so far is >= P (default 0.8)\n"
@@ -637,6 +638,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--no-pin") opt.pin_threads = false;
+        else if (a == "--mtp-model") opt.mtp_model_path = next();
         else if (a == "--mtp" || a == "--mtp-draft") opt.mtp_draft = std::stoi(next());
         else if (a == "--no-mtp") opt.mtp_draft = 0;
         else if (a == "--draft-p") opt.draft_p = std::stof(next());

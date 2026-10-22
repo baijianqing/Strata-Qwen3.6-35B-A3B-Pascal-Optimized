@@ -221,7 +221,7 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     log("GPU: %s, %.1f GiB, sm_%d%d", prop.name, prop.totalGlobalMem / 1073741824.0, prop.major, prop.minor);
-    if (!model_.load(opt.model_path, opt_.mtp_draft > 0, err)) return false;
+    if (!model_.load(opt.model_path, opt.mtp_model_path, opt_.mtp_draft > 0, err)) return false;
     const Config& c = model_.cfg;
     if (model_.cpu_lm_head) {
         opt_.use_graph = false;

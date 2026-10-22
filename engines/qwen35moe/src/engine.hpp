@@ -31,6 +31,7 @@ namespace sq {
 
 struct EngineOptions {
     std::string model_path;
+    std::string mtp_model_path;      // optional GGUF supplying the MTP block (e.g. Qwen3.6 for MiniCPM-V 4.7)
     int ctx = 32768;
     int cpu_threads = 8;
     int64_t vram_reserve_mb = 32;  // left free on the card once the engine is ready (other programs, driver)
