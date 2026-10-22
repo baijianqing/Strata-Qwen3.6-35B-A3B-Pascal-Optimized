@@ -918,6 +918,7 @@ struct Prefill::Impl {
     bool small_attn = false;
     bool shared_attn_kv = false;
     bool attn_bank_layout = false;
+    bool attn_ss_pad = false;   // pad the score-row pitch by one float to remove bank conflicts
     int attn_aq = 0;
     bool layer_major = false;
     int layer_tile = 1024;
@@ -1250,15 +1251,25 @@ bool Prefill::init(std::string& err, int tile_override) {
     if (const char* v = std::getenv("STRATA_PREFILL_ATTN_BANK_LAYOUT"); !v || std::strcmp(v, "0") != 0) {
         P.attn_bank_layout = P.layer_major && P.shared_attn_kv && P.attn_aq == 6;
         if (P.attn_bank_layout) {
+            if (const char* v = std::getenv("STRATA_PREFILL_ATTN_SS_PAD")) P.attn_ss_pad = std::atoi(v) != 0;
             constexpr size_t bytes = attn_layout_smem<6, true, true, true>();
+            constexpr size_t bytes_pad = attn_layout_smem<6, true, true, true, 1>();
             static_assert(bytes == 48960, "AQ6 bank-layout shared memory changed");
             SQ_CHECK(192 <= prop.maxThreadsPerBlock && 192 <= prop.maxThreadsDim[0],
                      "AQ6 bank-layout attention needs 192 threads per block");
-            SQ_CHECK(bytes <= shared_limit, "AQ6 bank-layout attention needs %zu bytes, device supports %zu", bytes, shared_limit);
-            if (bytes > prop.sharedMemPerBlock)
+            const size_t use_bytes = P.attn_ss_pad ? bytes_pad : bytes;
+            SQ_CHECK(use_bytes <= shared_limit, "AQ6 bank-layout attention needs %zu bytes, device supports %zu",
+                     use_bytes, shared_limit);
+            if (P.attn_ss_pad) {
+                if (bytes_pad > prop.sharedMemPerBlock)
+                    CUDA_CHECK(cudaFuncSetAttribute(attn_layout_kernel<6, true, true, true, 1>,
+                                                   cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes_pad));
+            } else if (bytes > prop.sharedMemPerBlock) {
                 CUDA_CHECK(cudaFuncSetAttribute(attn_layout_kernel<6, true, true, true>,
                                                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
-            log("prompt attention: AQ6 bank layout, %zu bytes shared memory (+768), no additional global VRAM; prepared main layers only", bytes);
+            }
+            log("prompt attention: AQ6 bank layout, %zu bytes shared memory (+768), SS_PAD %d, "
+                "no additional global VRAM; prepared main layers only", use_bytes, P.attn_ss_pad ? 1 : 0);
         } else {
             log("prompt attention bank layout not enabled: requires layer-major prefill with shared K/V and AQ6");
         }
@@ -1418,9 +1429,14 @@ void Prefill::mixer_prepared(int il, int T, int p0) {
                                                                       (__half*)E.vc_[il], E.kv_capacity_);
         mark(MixerProfile::ATTN_PREP);
         if (P.attn_bank_layout && il < c.n_layer) {
-            attn_layout_kernel<6, true, true, true><<<dim3((T + 5) / 6, kNKV), 192,
-                                                     attn_layout_smem<6, true, true, true>(), s>>>(
-                P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il], T, p0, E.kv_capacity_, P.big, ld, P.Y);
+            if (P.attn_ss_pad)
+                attn_layout_kernel<6, true, true, true, 1><<<dim3((T + 5) / 6, kNKV), 192,
+                                                            attn_layout_smem<6, true, true, true, 1>(), s>>>(
+                    P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il], T, p0, E.kv_capacity_, P.big, ld, P.Y);
+            else
+                attn_layout_kernel<6, true, true, true><<<dim3((T + 5) / 6, kNKV), 192,
+                                                          attn_layout_smem<6, true, true, true>(), s>>>(
+                    P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il], T, p0, E.kv_capacity_, P.big, ld, P.Y);
         } else {
             launch_attn_prefill(P.shared_attn_kv, P.attn_aq, P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il],
                                 T, p0, E.kv_capacity_, 0, 0, P.big, ld, P.Y, s);

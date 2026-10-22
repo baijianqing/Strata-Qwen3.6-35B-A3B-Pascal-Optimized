@@ -1,25 +1,26 @@
 // Isolated exact-layout experiment; include after accepted constants/helpers.
 #pragma once
 // PAD_Q changes shared Q pitch only. PERMUTE_K changes score ownership, not softmax/key order.
-template <int AQ, bool SHARE_KV = false, bool PAD_Q = false, bool PERMUTE_K = false>
+template <int AQ, bool SHARE_KV = false, bool PAD_Q = false, bool PERMUTE_K = false, int SS_PAD = 0>
 constexpr size_t attn_layout_smem() {
     constexpr int AR = AQ * 8;
     return (size_t)AR * (kHD + (PAD_Q ? 8 : 0)) * 2 + (size_t)kAK * kKPad * 2 + (SHARE_KV ? 0 : (size_t)kAK * kHD * 2) +
-           (size_t)AR * kAK * 4 + 3 * AR * 4;
+           (size_t)AR * (kAK + SS_PAD) * 4 + 3 * AR * 4;
 }
 
-template <int AQ, bool SHARE_KV = false, bool PAD_Q = false, bool PERMUTE_K = false>
+template <int AQ, bool SHARE_KV = false, bool PAD_Q = false, bool PERMUTE_K = false, int SS_PAD = 0>
 __global__ void __launch_bounds__(256) attn_layout_kernel(const __half* __restrict__ Qh, const __half* __restrict__ kc,
                                                            const __half* __restrict__ vc, int T, int p0, int max_ctx,
                                                            const float* __restrict__ qkv, int ld, __half* __restrict__ out) {
     constexpr int kAQ = AQ, kAR = AQ * 8;
     constexpr int kQStride = kHD + (PAD_Q ? 8 : 0);
+    constexpr int kSS = kAK + SS_PAD;   // score-row pitch: +1 removes same-bank rows in softmax/score
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __half* sQ = (__half*)smem_raw;                          // [64][256]
     __half* sK = sQ + kAR * kQStride;                              // [32][264]
     __half* sV = SHARE_KV ? sK : sK + kAK * kKPad;             // [32][256], optionally aliases K
     float* sS = (float*)(SHARE_KV ? sK + kAK * kKPad : sV + kAK * kHD); // after max(K,V) when shared
-    float* sM = sS + kAR * kAK;                               // [64] running max
+    float* sM = sS + kAR * kSS;                               // [64] running max
     float* sL = sM + kAR;                                     // [64] running sum
     float* sA = sL + kAR;                                     // [64] rescale factor
     const int kh = blockIdx.y, tq0 = blockIdx.x * kAQ, tid = threadIdx.x;
@@ -79,14 +80,14 @@ __global__ void __launch_bounds__(256) attn_layout_kernel(const __half* __restri
 #pragma unroll
                 for (int u = 0; u < 4; ++u) {
                     const int kp = k0 + (PERMUTE_K ? kq + u * 8 : kq * 4 + u);
-                    sS[r * kAK + (PERMUTE_K ? kq + u * 8 : kq * 4 + u)] = (kp <= qpos && (r >> 3) < nq) ? s[a][u] : -INFINITY;
+                    sS[r * kSS + (PERMUTE_K ? kq + u * 8 : kq * 4 + u)] = (kp <= qpos && (r >> 3) < nq) ? s[a][u] : -INFINITY;
                 }
             }
         }
         __syncthreads();
         {   // online softmax: 4 threads per row, 8 scores each
             const int r = tid >> 2, part = tid & 3;
-            float* row = sS + r * kAK + part * 8;
+            float* row = sS + r * kSS + part * 8;
             float mx = -INFINITY;
 #pragma unroll
             for (int u = 0; u < 8; ++u) mx = fmaxf(mx, row[u]);
@@ -143,7 +144,7 @@ __global__ void __launch_bounds__(256) attn_layout_kernel(const __half* __restri
             }
 #pragma unroll
             for (int a = 0; a < 8; ++a) {
-                const float p = sS[(warp * 8 + a) * kAK + j];
+                const float p = sS[(warp * 8 + a) * kSS + j];
 #pragma unroll
                 for (int b = 0; b < 8; ++b) acc[a][b] += p * vf[b];
             }
