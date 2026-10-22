@@ -267,8 +267,13 @@ int serve(Engine& eng, const ServeOptions& so) {
         std::sort(cks.begin(), cks.end());
         eng.reset_prefill_record();
         int pos = reused;
+        int feed_chunk = 4096;
+        if (const char* v = std::getenv("STRATA_SERVE_FEED")) {
+            feed_chunk = std::atoi(v);
+            SQ_CHECK(feed_chunk > 0, "STRATA_SERVE_FEED must be a positive token count");
+        }
         while (pos < n) {
-            int end = std::min(pos + 4096, n);
+            int end = std::min(pos + feed_chunk, n);
             for (int c : cks)
                 if (c > pos && c < end) { end = c; break; }
             eng.feed(ids.data() + pos, end - pos);
