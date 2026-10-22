@@ -1751,8 +1751,12 @@ void Prefill::run_layer_major_window(const int* tokens, int total_n, int window_
     Engine& E = e_;
     const Config& c = E.model_.cfg;
     cudaStream_t s = P.s;
-    SQ_CHECK(P.use_mmq && std::all_of(P.mmq_layer.begin(), P.mmq_layer.end(), [](char x) { return x != 0; }),
-             "layer-major prefill requires MMQ coverage for every main and MTP layer");
+    // Only the main layers run through this window.  The MTP layer is tiled separately by Prefill::mtp and may
+    // use the non-MMQ expert path (e.g. an imported Q8_0/Q6_K MTP sidecar) without affecting the main window.
+    SQ_CHECK(P.use_mmq && (int)P.mmq_layer.size() >= c.n_layer &&
+                 std::all_of(P.mmq_layer.begin(), P.mmq_layer.begin() + c.n_layer,
+                             [](char x) { return x != 0; }),
+             "layer-major prefill requires MMQ coverage for every main layer");
     const int tile = P.layer_tile;
     int route_cap = tile * 8;
     // A lower cap is useful for exercising compact row subpasses with short prompts. The default preserves
