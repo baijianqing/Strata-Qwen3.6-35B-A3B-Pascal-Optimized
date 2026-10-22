@@ -727,15 +727,17 @@ __global__ void gdn_normgate_rows_kernel(const float* __restrict__ o, const floa
 /// grid (T, 20): 16 q heads, 2 k heads, 2 v heads.
 __global__ void attn_prep_rows_kernel(const float* __restrict__ qkv, int ld, const float* __restrict__ qnw,
                                       const float* __restrict__ knw, float eps, int p0, float base,
-                                      __half* __restrict__ Qh, __half* __restrict__ kc, __half* __restrict__ vc, int max_ctx) {
+                                      __half* __restrict__ Qh, __half* __restrict__ kc, __half* __restrict__ vc, int max_ctx,
+                                      int kv_ring) {
     __shared__ float sh[32];
     __shared__ float sv[kHD];
     const int t = blockIdx.x, b = blockIdx.y, i = threadIdx.x;
     const float* row = qkv + (size_t)t * ld;
     const int pos = p0 + t;
+    const int slot = kv_ring > 0 ? pos % kv_ring : pos;   // MTP layer stores into a fixed ring
     if (b >= kNH + kNKV) {
         const int kh = b - kNH - kNKV;
-        vc[((size_t)kh * max_ctx + pos) * kHD + i] = __float2half_rn(row[kNH * 2 * kHD + kNKV * kHD + kh * kHD + i]);
+        vc[((size_t)kh * max_ctx + slot) * kHD + i] = __float2half_rn(row[kNH * 2 * kHD + kNKV * kHD + kh * kHD + i]);
         return;
     }
     const bool isq = b < kNH;
@@ -754,7 +756,7 @@ __global__ void attn_prep_rows_kernel(const float* __restrict__ qkv, int ld, con
     }
     __syncthreads();
     if (isq) Qh[((size_t)t * kNH + b) * kHD + i] = __float2half_rn(sv[i] * 0.0625f);
-    else kc[((size_t)(b - kNH) * max_ctx + pos) * kHD + i] = __float2half_rn(sv[i]);
+    else kc[((size_t)(b - kNH) * max_ctx + slot) * kHD + i] = __float2half_rn(sv[i]);
 }
 
 constexpr int kAK = 32;               // keys per tile
@@ -813,13 +815,16 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(const __half* __restr
     const int rp = tid >> 3, kq = tid & 7;
     for (int k0 = k_begin; k0 < n_keys; k0 += kAK) {
         __syncthreads();
+        // Ring offset for the MTP layer. The tile is kAK keys and both k0 and the ring are 32/64-aligned,
+        // so the whole 32-key tile maps contiguously.
+        const int k0s = kv_window > 0 ? (k0 % max_ctx) : k0;
         for (int i = tid; i < kAK * kHD / 8; i += AQ * 32) {
             const int j = i / (kHD / 8), c8 = i % (kHD / 8);
             int4 kv4 = make_int4(0, 0, 0, 0), vv4 = make_int4(0, 0, 0, 0);
             if (k0 + j < n_keys) {
-                kv4 = *(const int4*)(kc + ((size_t)kh * max_ctx + k0 + j) * kHD + c8 * 8);
+                kv4 = *(const int4*)(kc + ((size_t)kh * max_ctx + k0s + j) * kHD + c8 * 8);
                 if constexpr (!SHARE_KV)
-                    vv4 = *(const int4*)(vc + ((size_t)kh * max_ctx + k0 + j) * kHD + c8 * 8);
+                    vv4 = *(const int4*)(vc + ((size_t)kh * max_ctx + k0s + j) * kHD + c8 * 8);
             }
             *(int4*)(sK + j * kKPad + c8 * 8) = kv4;
             if constexpr (!SHARE_KV) *(int4*)(sV + j * kHD + c8 * 8) = vv4;
@@ -888,7 +893,7 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(const __half* __restr
                 const int j = i / (kHD / 8), c8 = i % (kHD / 8);
                 int4 vv4 = make_int4(0, 0, 0, 0);
                 if (k0 + j < n_keys)
-                    vv4 = *(const int4*)(vc + ((size_t)kh * max_ctx + k0 + j) * kHD + c8 * 8);
+                    vv4 = *(const int4*)(vc + ((size_t)kh * max_ctx + k0s + j) * kHD + c8 * 8);
                 *(int4*)(sV + j * kHD + c8 * 8) = vv4;
             }
             __syncthreads();
@@ -1506,7 +1511,7 @@ void Prefill::mixer_prepared(int il, int T, int p0) {
         mark(MixerProfile::INPUT);
         attn_prep_rows_kernel<<<dim3(T, kNH + 2 * kNKV), 256, 0, s>>>(P.big, ld, L.q_norm, L.k_norm, eps, p0,
                                                                       c.rope_base, P.Qh, (__half*)E.kc_[il],
-                                                                      (__half*)E.vc_[il], E.kv_capacity_);
+                                                                      (__half*)E.vc_[il], E.kv_capacity_, 0);
         mark(MixerProfile::ATTN_PREP);
         if (P.attn_bank_layout && il < c.n_layer) {
             if (P.attn_reg_q)
@@ -1565,12 +1570,15 @@ void Prefill::layer(int il, int T, int p0) {
         gemm(P.cb, P.W16, P.Y, P.X, kE, 4096, T, kE, 1.0f);
     } else {
         const int ld = L.qkv.rows;    // 9216
+        const int kv_stride = E.kv_stride_for(il);
+        const int kv_ring = E.mtp_kv_capacity() > 0 && il == c.n_layer ? E.mtp_kv_capacity() : 0;
         dequant_q8(L.qkv, P.W16, s);
         gemm(P.cb, P.W16, P.Hh, P.big, L.qkv.rows, kE, T, ld, 0.0f);
         attn_prep_rows_kernel<<<dim3(T, kNH + 2 * kNKV), 256, 0, s>>>(P.big, ld, L.q_norm, L.k_norm, eps, p0, c.rope_base,
-                                                                      P.Qh, (__half*)E.kc_[il], (__half*)E.vc_[il], E.kv_capacity_);
+                                                                      P.Qh, (__half*)E.kc_[il], (__half*)E.vc_[il], kv_stride,
+                                                                      kv_ring);
         launch_attn_prefill(P.shared_attn_kv, P.attn_aq, P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il],
-                            T, p0, E.kv_capacity_, P.attn_window, P.attn_floor, P.big, ld, P.Y, s);
+                            T, p0, kv_stride, P.attn_window, P.attn_floor, P.big, ld, P.Y, s);
         dequant_q8(L.wo, P.W16, s);
         gemm(P.cb, P.W16, P.Y, P.X, kE, 4096, T, kE, 1.0f);
     }

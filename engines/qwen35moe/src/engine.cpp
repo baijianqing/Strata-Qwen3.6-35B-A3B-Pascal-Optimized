@@ -97,6 +97,7 @@ Engine::~Engine() {
     for (auto& ck : ckpts_) {
         if (ck.arena) { if (ckpt_host_) cudaFreeHost(ck.arena); else cudaFree(ck.arena); }
         if (ck.hin) { if (ckpt_host_) cudaFreeHost(ck.hin); else cudaFree(ck.hin); }
+        if (ck.mtp_kv) cudaFreeHost(ck.mtp_kv);
     }
     if (cache_upload_host_) cudaFreeHost(cache_upload_host_);
     if (cache_residency_host_) cudaFreeHost(cache_residency_host_);
@@ -275,6 +276,15 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
             kv_capacity_ = kv_capacity_ > opt_.ctx / 2 ? opt_.ctx : kv_capacity_ * 2;
         log("lazy KV enabled: initial capacity %d, configured context %d; grows on demand by releasing expert slots",
             kv_capacity_, opt_.ctx);
+    }
+    // A sliding MTP window never reads more than mtp_window_ keys, so the MTP layer's KV can be a fixed ring.
+    // Round up to 64 (the decode key-step) and keep at least 128 so a 64-key step crosses the seam at most once.
+    if (mtp_on_ && mtp_window_ > 0) {
+        const int rounded = (std::max(mtp_window_, 128) + 63) / 64 * 64;
+        mtp_kv_capacity_ = std::min(rounded, opt_.ctx);
+        log("MTP KV ring: %d slots for window %d (%.1f MiB instead of the full-context MTP layer)",
+            mtp_kv_capacity_, mtp_window_,
+            (double)2 * c.n_head_kv * mtp_kv_capacity_ * (kv_int8_ ? c.head_dim + 4 : c.head_dim * 2) / 1048576.0);
     }
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     if (profile_pipeline_) {
@@ -509,17 +519,27 @@ void Engine::alloc_state() {
         log("checkpoint storage: %zu slot(s) in %s memory (%.0f MiB %s)", ckpts_.size(),
             ckpt_host_ ? "pinned host" : "device", ckpts_.size() * state_floats_ * 4 / 1048576.0,
             ckpt_host_ ? "VRAM saved" : "VRAM used");
+    if (mtp_on_ && mtp_kv_capacity_ > 0 && !ckpts_.empty()) {
+        const size_t k_bytes = (size_t)c.n_head_kv * mtp_kv_capacity_ * (kv_int8_ ? c.head_dim : c.head_dim * 2);
+        const size_t s_bytes = kv_int8_ ? (size_t)c.n_head_kv * mtp_kv_capacity_ * sizeof(float) : 0;
+        mtp_kv_bytes_ = 2 * k_bytes + 2 * s_bytes;
+        for (auto& ck : ckpts_)
+            CUDA_CHECK(cudaHostAlloc(&ck.mtp_kv, mtp_kv_bytes_, cudaHostAllocDefault));
+        log("MTP KV ring checkpoints: %.1f MiB pinned for %zu slot(s)",
+            (double)mtp_kv_bytes_ * ckpts_.size() / 1048576.0, ckpts_.size());
+    }
     int64_t off = 0;
     for (int il = 0; il < NL; ++il) {
         if (c.is_attn(il)) {
+            const int stride = (mtp_kv_capacity_ > 0 && il == c.n_layer) ? mtp_kv_capacity_ : kv_capacity_;
             if (kv_int8_) {
-                kc_i8_[il] = dmalloc<int8_t>((size_t)c.n_head_kv * kv_capacity_ * c.head_dim);
-                vc_i8_[il] = dmalloc<int8_t>((size_t)c.n_head_kv * kv_capacity_ * c.head_dim);
-                kc_scale_[il] = dmalloc<float>((size_t)c.n_head_kv * kv_capacity_);
-                vc_scale_[il] = dmalloc<float>((size_t)c.n_head_kv * kv_capacity_);
+                kc_i8_[il] = dmalloc<int8_t>((size_t)c.n_head_kv * stride * c.head_dim);
+                vc_i8_[il] = dmalloc<int8_t>((size_t)c.n_head_kv * stride * c.head_dim);
+                kc_scale_[il] = dmalloc<float>((size_t)c.n_head_kv * stride);
+                vc_scale_[il] = dmalloc<float>((size_t)c.n_head_kv * stride);
             } else {
-                kc_[il] = dmalloc<uint16_t>((size_t)c.n_head_kv * kv_capacity_ * c.head_dim);
-                vc_[il] = dmalloc<uint16_t>((size_t)c.n_head_kv * kv_capacity_ * c.head_dim);
+                kc_[il] = dmalloc<uint16_t>((size_t)c.n_head_kv * stride * c.head_dim);
+                vc_[il] = dmalloc<uint16_t>((size_t)c.n_head_kv * stride * c.head_dim);
             }
         } else {
             conv_st_[il] = state_arena_ + off;
@@ -559,7 +579,9 @@ void Engine::ensure_kv_capacity(int tokens) {
     const int previous = kv_capacity_;
     int capacity = previous;
     while (capacity < tokens) capacity = capacity > opt_.ctx / 2 ? opt_.ctx : capacity * 2;
-    const int64_t extra = kv_bytes() / previous * (capacity - previous);
+    const int64_t per_token = 2 * c.n_head_kv * (kv_int8_ ? c.head_dim + 4 : c.head_dim * 2);
+    const int64_t growing_layers = c.n_attn_layers() + (mtp_kv_capacity_ > 0 ? 0 : c.n_mtp);
+    const int64_t extra = growing_layers * per_token * (capacity - previous);
     const int64_t cache_before = cache_bytes_;
     const double started = now_ms();
     CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -604,6 +626,7 @@ void Engine::ensure_kv_capacity(int tokens) {
         CUDA_CHECK(cudaStreamSynchronize(stream_)); // pinned staging is reused by the next buffer
     };
     for (int layer = 0; layer < c.n_moe_layers(); ++layer) {
+        if (mtp_kv_capacity_ > 0 && layer == c.n_layer) continue; // fixed MTP ring, independent of context growth
         if (kv_int8_) {
             grow_buffer(kc_i8_[layer], c.head_dim);
             grow_buffer(vc_i8_[layer], c.head_dim);
@@ -1347,15 +1370,16 @@ void Engine::capture_prompt_route_graph(int il) {
         k_gemv_q8(L.ssm_out, yq_, attn_out_, T, s);
     } else {
         k_gemv_q8(L.qkv, xq_, qkv_, T, s);
+        const int kv_stride = kv_stride_for(il);
         if (kv_int8_)
             k_attn_prep_i8(qkv_, L.q_norm, L.k_norm, eps, P, c.rope_base, qbuf_, kc_i8_[il], vc_i8_[il],
-                           kc_scale_[il], vc_scale_[il], kv_capacity_, T, s);
-        else k_attn_prep(qkv_, L.q_norm, L.k_norm, eps, P, c.rope_base, qbuf_, kc_[il], vc_[il], kv_capacity_, T, s);
+                           kc_scale_[il], vc_scale_[il], kv_stride, T, s);
+        else k_attn_prep(qkv_, L.q_norm, L.k_norm, eps, P, c.rope_base, qbuf_, kc_[il], vc_[il], kv_stride, T, s);
         if (kv_int8_)
-            k_attn_decode_i8(qbuf_, kc_i8_[il], vc_i8_[il], kc_scale_[il], vc_scale_[il], P, kv_capacity_,
+            k_attn_decode_i8(qbuf_, kc_i8_[il], vc_i8_[il], kc_scale_[il], vc_scale_[il], P, kv_stride,
                              part_o_, part_ml_, T, s);
-        else k_attn_decode(qbuf_, kc_[il], vc_[il], P, kv_capacity_, part_o_, part_ml_, T, s);
-        k_attn_combine(part_o_, part_ml_, qkv_, P, kv_capacity_, yq_, T, s);
+        else k_attn_decode(qbuf_, kc_[il], vc_[il], P, kv_stride, part_o_, part_ml_, T, s);
+        k_attn_combine(part_o_, part_ml_, qkv_, P, kv_stride, yq_, T, s);
         k_gemv_q8(L.wo, yq_, attn_out_, T, s);
     }
     k_add_rmsnorm_q(x_, attn_out_, L.post_norm, eps, xn_, xq_, T, s);
@@ -1421,10 +1445,11 @@ void Engine::build_layer(cudaStream_t s, int il, int T, const StepParams* P, con
     } else {
         k_gemv_q8(L.qkv, xq_, qkv_, T, s);
         check_decode_launch(s, il, "attention qkv projection");
+        const int kv_stride = kv_stride_for(il);
         if (kv_int8_)
             k_attn_prep_i8(qkv_, L.q_norm, L.k_norm, eps, P, c.rope_base, qbuf_, kc_i8_[il], vc_i8_[il],
-                           kc_scale_[il], vc_scale_[il], kv_capacity_, T, s);
-        else k_attn_prep(qkv_, L.q_norm, L.k_norm, eps, P, c.rope_base, qbuf_, kc_[il], vc_[il], kv_capacity_, T, s);
+                           kc_scale_[il], vc_scale_[il], kv_stride, T, s);
+        else k_attn_prep(qkv_, L.q_norm, L.k_norm, eps, P, c.rope_base, qbuf_, kc_[il], vc_[il], kv_stride, T, s);
         check_decode_launch(s, il, "attention preparation");
         if (mtp_tail && mtp_state_only_) {
             // This is one full-attention MTP layer: its KV depends only on the input projection/norm.
@@ -1454,10 +1479,10 @@ void Engine::build_layer(cudaStream_t s, int il, int T, const StepParams* P, con
             ++mtp_last_row_steps_;
         }
         if (kv_int8_)
-            k_attn_decode_i8(attention_q, kc_i8_[il], vc_i8_[il], kc_scale_[il], vc_scale_[il], P, kv_capacity_, part_o_, part_ml_, T, s);
-        else k_attn_decode(attention_q, kc_[il], vc_[il], P, kv_capacity_, part_o_, part_ml_, T, s);
+            k_attn_decode_i8(attention_q, kc_i8_[il], vc_i8_[il], kc_scale_[il], vc_scale_[il], P, kv_stride, part_o_, part_ml_, T, s);
+        else k_attn_decode(attention_q, kc_[il], vc_[il], P, kv_stride, part_o_, part_ml_, T, s);
         check_decode_launch(s, il, "attention decode");
-        k_attn_combine(part_o_, part_ml_, attention_qkv, P, kv_capacity_, yq_, T, s);
+        k_attn_combine(part_o_, part_ml_, attention_qkv, P, kv_stride, yq_, T, s);
         check_decode_launch(s, il, "attention combine");
         k_gemv_q8(L.wo, yq_, attn_out_, T, s);
         check_decode_launch(s, il, "attention output projection");
@@ -2534,9 +2559,31 @@ int Engine::reuse_prefix(const std::vector<int>& prompt) {
         reset();
         return report(0);
     }
+    const Config& c = model_.cfg;
     const cudaMemcpyKind from_ckpt = ckpt_host_ ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
     CUDA_CHECK(cudaMemcpyAsync(state_arena_, pick->arena, state_floats_ * 4, from_ckpt, stream_));
-    CUDA_CHECK(cudaMemcpyAsync(mtp_hin_, pick->hin, (size_t)kMaxT * model_.cfg.n_embd * 4, from_ckpt, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(mtp_hin_, pick->hin, (size_t)kMaxT * c.n_embd * 4, from_ckpt, stream_));
+    if (mtp_kv_bytes_ > 0) {
+        // The MTP ring may have wrapped since this checkpoint; restore its exact last-window contents.
+        const size_t k_bytes = (size_t)c.n_head_kv * mtp_kv_capacity_ * (kv_int8_ ? c.head_dim : c.head_dim * 2);
+        const size_t s_bytes = kv_int8_ ? (size_t)c.n_head_kv * mtp_kv_capacity_ * sizeof(float) : 0;
+        const uint8_t* src = (const uint8_t*)pick->mtp_kv;
+        size_t off = 0;
+        auto restore = [&](void* dev, size_t bytes) {
+            CUDA_CHECK(cudaMemcpyAsync(dev, src + off, bytes, cudaMemcpyHostToDevice, stream_));
+            off += bytes;
+        };
+        const int mtp_layer = c.n_layer;
+        if (kv_int8_) {
+            restore(kc_i8_[mtp_layer], k_bytes);
+            restore(vc_i8_[mtp_layer], k_bytes);
+            restore(kc_scale_[mtp_layer], s_bytes);
+            restore(vc_scale_[mtp_layer], s_bytes);
+        } else {
+            restore(kc_[mtp_layer], k_bytes);
+            restore(vc_[mtp_layer], k_bytes);
+        }
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     pick->stamp = ++ckpt_clock_;
     history_ = pick->tokens;
@@ -2562,9 +2609,30 @@ void Engine::save_checkpoint(bool base) {
     if (!base || ckpts_.size() == 1)
         for (size_t i = first; i < ckpts_.size(); ++i)
             if (ckpts_[i].stamp < slot->stamp) slot = &ckpts_[i];
+    const Config& c = model_.cfg;
     const cudaMemcpyKind to_ckpt = ckpt_host_ ? cudaMemcpyDeviceToHost : cudaMemcpyDeviceToDevice;
     CUDA_CHECK(cudaMemcpyAsync(slot->arena, state_arena_, state_floats_ * 4, to_ckpt, stream_));
-    CUDA_CHECK(cudaMemcpyAsync(slot->hin, mtp_hin_, (size_t)kMaxT * model_.cfg.n_embd * 4, to_ckpt, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(slot->hin, mtp_hin_, (size_t)kMaxT * c.n_embd * 4, to_ckpt, stream_));
+    if (mtp_kv_bytes_ > 0) {
+        const size_t k_bytes = (size_t)c.n_head_kv * mtp_kv_capacity_ * (kv_int8_ ? c.head_dim : c.head_dim * 2);
+        const size_t s_bytes = kv_int8_ ? (size_t)c.n_head_kv * mtp_kv_capacity_ * sizeof(float) : 0;
+        uint8_t* dst = (uint8_t*)slot->mtp_kv;
+        size_t off = 0;
+        auto save = [&](const void* dev, size_t bytes) {
+            CUDA_CHECK(cudaMemcpyAsync(dst + off, dev, bytes, cudaMemcpyDeviceToHost, stream_));
+            off += bytes;
+        };
+        const int mtp_layer = c.n_layer;
+        if (kv_int8_) {
+            save(kc_i8_[mtp_layer], k_bytes);
+            save(vc_i8_[mtp_layer], k_bytes);
+            save(kc_scale_[mtp_layer], s_bytes);
+            save(vc_scale_[mtp_layer], s_bytes);
+        } else {
+            save(kc_[mtp_layer], k_bytes);
+            save(vc_[mtp_layer], k_bytes);
+        }
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     slot->tokens = history_;
     slot->mtp_k = mtp_k_;
@@ -2704,24 +2772,49 @@ std::vector<uint8_t> Engine::debug_prefix_state() {
     if (mtp_on_ && mtp_k_ > 0) append(mtp_hin_, (size_t)mtp_k_ * c.n_embd * sizeof(float));
     // Only live causal positions are meaningful. Pending MTP pairs have not written their KV positions yet;
     // verification/checkpoint suffixes beyond this prefix must not enter its state identity.
-    auto append_heads = [&](const void* source, int positions, size_t token_bytes) {
+    auto append_heads = [&](const void* source, int positions, size_t token_bytes, int stride) {
         if (!source || positions <= 0) return;
         const size_t width = (size_t)positions * token_bytes;
         const size_t offset = result.size();
         result.resize(offset + width * c.n_head_kv);
-        CUDA_CHECK(cudaMemcpy2D(result.data() + offset, width, source, (size_t)kv_capacity_ * token_bytes,
+        CUDA_CHECK(cudaMemcpy2D(result.data() + offset, width, source, (size_t)stride * token_bytes,
                                 width, c.n_head_kv, cudaMemcpyDeviceToHost));
+    };
+    // A wrapped MTP ring stores only the last `cap` positions; emit them in logical order.
+    auto append_ring_heads = [&](const void* source, int positions, size_t token_bytes, int cap) {
+        if (!source || positions <= 0) return;
+        const int count = std::min(positions, cap);
+        const int start = positions - count;
+        const size_t width = (size_t)count * token_bytes;
+        const size_t offset = result.size();
+        result.resize(offset + width * c.n_head_kv);
+        const size_t ring_pitch = (size_t)cap * token_bytes;
+        const int s0 = start % cap;
+        const int first = std::min(count, cap - s0);
+        auto copy = [&](size_t dst_off, const uint8_t* src, int n) {
+            if (n <= 0) return;
+            CUDA_CHECK(cudaMemcpy2D(result.data() + offset + dst_off, width, src, ring_pitch,
+                                    (size_t)n * token_bytes, c.n_head_kv, cudaMemcpyDeviceToHost));
+        };
+        copy(0, (const uint8_t*)source + (size_t)s0 * token_bytes, first);
+        copy((size_t)first * token_bytes, (const uint8_t*)source, count - first);
     };
     for (int layer = 0; layer < c.n_moe_layers(); ++layer) {
         const int positions = layer < c.n_layer ? n_past_ : std::max(0, n_past_ - mtp_k_);
+        const int stride = kv_stride_for(layer);
+        const int ring = stride != kv_capacity_ ? stride : 0;
+        auto append_layer = [&](const void* source, size_t token_bytes) {
+            if (ring > 0) append_ring_heads(source, positions, token_bytes, ring);
+            else append_heads(source, positions, token_bytes, kv_capacity_);
+        };
         if (kv_int8_) {
-            append_heads(kc_i8_[layer], positions, c.head_dim * sizeof(int8_t));
-            append_heads(vc_i8_[layer], positions, c.head_dim * sizeof(int8_t));
-            append_heads(kc_scale_[layer], positions, sizeof(float));
-            append_heads(vc_scale_[layer], positions, sizeof(float));
+            append_layer(kc_i8_[layer], c.head_dim * sizeof(int8_t));
+            append_layer(vc_i8_[layer], c.head_dim * sizeof(int8_t));
+            append_layer(kc_scale_[layer], sizeof(float));
+            append_layer(vc_scale_[layer], sizeof(float));
         } else {
-            append_heads(kc_[layer], positions, c.head_dim * sizeof(uint16_t));
-            append_heads(vc_[layer], positions, c.head_dim * sizeof(uint16_t));
+            append_layer(kc_[layer], c.head_dim * sizeof(uint16_t));
+            append_layer(vc_[layer], c.head_dim * sizeof(uint16_t));
         }
     }
     return result;

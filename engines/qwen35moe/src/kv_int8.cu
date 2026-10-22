@@ -70,12 +70,13 @@ __global__ void __launch_bounds__(256) attn_prep_i8_kernel(
     __shared__ float sv[kHD];
     const int b = blockIdx.x, t = threadIdx.x, tk = blockIdx.y;
     const int pos = P->pos + tk;
+    const int slot = P->kv_window > 0 ? pos % max_ctx : pos;   // MTP ring
     qkv += tk * kQKV;
     q_out += tk * kNH * kHD;
     if (b >= kNH + kNKV) {
         const int kh = b - kNH - kNKV;
         const float value = qkv[kNH * 2 * kHD + kNKV * kHD + kh * kHD + t];
-        store_head(value, vc, vd, (size_t)kh * max_ctx + pos, t, sh);
+        store_head(value, vc, vd, (size_t)kh * max_ctx + slot, t, sh);
         return;
     }
     const bool isq = b < kNH;
@@ -87,7 +88,7 @@ __global__ void __launch_bounds__(256) attn_prep_i8_kernel(
     rope_neox64(sv, t, pos, rope_base);
     __syncthreads();
     if (isq) q_out[b * kHD + t] = sv[t] * 0.0625f;
-    else store_head(sv[t], kc, kd, (size_t)(b - kNH) * max_ctx + pos, t, sh);
+    else store_head(sv[t], kc, kd, (size_t)(b - kNH) * max_ctx + slot, t, sh);
 }
 
 __device__ __forceinline__ int attn_chunk(int L) {
@@ -106,8 +107,11 @@ __global__ void __launch_bounds__(256) attn_decode_i8_kernel(
     __shared__ float sm[8], sl[8], sscale[8];
     const int split = blockIdx.x, kh = blockIdx.y, t = threadIdx.x, tk = blockIdx.z;
     const int L = P->pos + tk + 1;
-    const int chunk = attn_chunk(L);
-    const int j0 = split * chunk;
+    // Same sliding window and fixed-size ring as the FP16 decoder for the MTP layer.
+    const int wstart = P->kv_window > 0 ? max(0, L - P->kv_window) : 0;
+    const int nkeys = L - wstart;
+    const int chunk = attn_chunk(nkeys);
+    const int j0 = wstart + split * chunk;
     if (j0 >= L) return;
     q += tk * kNH * kHD;
     part_o += (size_t)tk * kNH * kAttSplits * kHD;
@@ -119,11 +123,15 @@ __global__ void __launch_bounds__(256) attn_decode_i8_kernel(
     const int key = t >> 2, part = t & 3;
     const int w = t >> 5, lane = t & 31;
     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const bool ring = P->kv_window > 0;
     for (int s0 = j0; s0 < j1; s0 += kAttSub) {
         const int n = min(kAttSub, j1 - s0);
+        const int rs = ring ? s0 % max_ctx : s0;
         float sc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         if (key < n) {
-            const size_t head_token = (size_t)kh * max_ctx + s0 + key;
+            int kidx = rs + key;
+            if (ring && kidx >= max_ctx) kidx -= max_ctx;
+            const size_t head_token = (size_t)kh * max_ctx + kidx;
             const int2* kr = reinterpret_cast<const int2*>(kc + head_token * kHD + part * 64);
             const float dkey = kd[head_token];
 #pragma unroll 2
@@ -168,15 +176,27 @@ __global__ void __launch_bounds__(256) attn_decode_i8_kernel(
             }
         }
         __syncthreads();
-        const size_t first = (size_t)kh * max_ctx + s0;
+        const int n1 = ring ? min(n, max_ctx - rs) : n;
+        const size_t first = (size_t)kh * max_ctx + rs;
         const int8_t* vb = vc + first * kHD + t;
 #pragma unroll
         for (int h = 0; h < 8; ++h) acc[h] *= sscale[h];
 #pragma unroll 8
-        for (int j = 0; j < n; ++j) {
+        for (int j = 0; j < n1; ++j) {
             const float v = static_cast<float>(vb[(size_t)j * kHD]) * vd[first + j];
 #pragma unroll
             for (int h = 0; h < 8; ++h) acc[h] += sp[h][j] * v;
+        }
+        if (ring && n1 < n) {
+            const size_t wrap = (size_t)kh * max_ctx;
+            const int8_t* vw = vc + wrap * kHD + t;
+#pragma unroll 8
+            for (int j = n1; j < n; ++j) {
+                const int wj = j - n1;
+                const float v = static_cast<float>(vw[(size_t)wj * kHD]) * vd[wrap + wj];
+#pragma unroll
+                for (int h = 0; h < 8; ++h) acc[h] += sp[h][j] * v;
+            }
         }
         __syncthreads();
     }

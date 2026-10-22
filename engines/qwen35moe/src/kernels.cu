@@ -1054,11 +1054,13 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const float* __restrict_
     __shared__ float sv[kHD];
     const int b = blockIdx.x, t = threadIdx.x, tk = blockIdx.y;
     const int pos = P->pos + tk;
+    // The MTP layer indexes a fixed-size ring (max_ctx); target layers keep the absolute position.
+    const int slot = P->kv_window > 0 ? pos % max_ctx : pos;
     qkv += tk * kQKV;
     q_out += tk * kNH * kHD;
     if (b >= kNH + kNKV) {
         const int kh = b - kNH - kNKV;
-        vc[((size_t)kh * max_ctx + pos) * kHD + t] = __float2half(qkv[kNH * 2 * kHD + kNKV * kHD + kh * kHD + t]);
+        vc[((size_t)kh * max_ctx + slot) * kHD + t] = __float2half(qkv[kNH * 2 * kHD + kNKV * kHD + kh * kHD + t]);
         return;
     }
     const bool isq = b < kNH;
@@ -1070,7 +1072,7 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const float* __restrict_
     rope_neox64(sv, t, pos, rope_base);
     __syncthreads();
     if (isq) q_out[b * kHD + t] = sv[t] * 0.0625f;   // 1/sqrt(256)
-    else kc[((size_t)(b - kNH) * max_ctx + pos) * kHD + t] = __float2half(sv[t]);
+    else kc[((size_t)(b - kNH) * max_ctx + slot) * kHD + t] = __float2half(sv[t]);
 }
 
 /// Keys per split for a context of L keys: a multiple of kAttSub, at most kAttSplits splits.
@@ -1101,6 +1103,7 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(const float* __restric
     part_o += (size_t)tk * kNH * kAttSplits * kHD;
     part_ml += (size_t)tk * kNH * kAttSplits * 2;
     const int j1 = min(j0 + chunk, L);
+    const bool ring = P->kv_window > 0;   // MTP layer: max_ctx is the physical ring size
     for (int i = t; i < 8 * kHD; i += 256) sq[i / kHD][i % kHD] = q[(kh * 8) * kHD + i];
     if (t < 8) { sm[t] = -INFINITY; sl[t] = 0.0f; }
     __syncthreads();
@@ -1109,9 +1112,12 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(const float* __restric
     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int s0 = j0; s0 < j1; s0 += kAttSub) {
         const int n = min(kAttSub, j1 - s0);
+        const int rs = ring ? s0 % max_ctx : s0;
         float sc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         if (key < n) {
-            const int4* kr = (const int4*)(kc + ((size_t)kh * max_ctx + s0 + key) * kHD + part * 64);
+            int kidx = rs + key;
+            if (ring && kidx >= max_ctx) kidx -= max_ctx;
+            const int4* kr = (const int4*)(kc + ((size_t)kh * max_ctx + kidx) * kHD + part * 64);
 #pragma unroll 2
             for (int c = 0; c < 8; ++c) {
                 const int4 raw = kr[c];
@@ -1158,14 +1164,24 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(const float* __restric
             }
         }
         __syncthreads();
-        const __half* vb = vc + ((size_t)kh * max_ctx + s0) * kHD + t;
+        const int n1 = ring ? min(n, max_ctx - rs) : n;   // first run before the ring seam
+        const __half* vb = vc + ((size_t)kh * max_ctx + rs) * kHD + t;
 #pragma unroll
         for (int h = 0; h < 8; ++h) acc[h] *= sscale[h];
 #pragma unroll 8
-        for (int j = 0; j < n; ++j) {
+        for (int j = 0; j < n1; ++j) {
             const float v = __half2float(vb[(size_t)j * kHD]);
 #pragma unroll
             for (int h = 0; h < 8; ++h) acc[h] += sp[h][j] * v;
+        }
+        if (ring && n1 < n) {
+            const __half* vw = vc + (size_t)kh * max_ctx * kHD + t;
+#pragma unroll 8
+            for (int j = n1; j < n; ++j) {
+                const float v = __half2float(vw[(size_t)(j - n1) * kHD]);
+#pragma unroll
+                for (int h = 0; h < 8; ++h) acc[h] += sp[h][j] * v;
+            }
         }
         __syncthreads();   // sp / sscale are rewritten by the next step
     }

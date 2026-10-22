@@ -114,6 +114,8 @@ public:
     bool mtp() const { return mtp_on_; }
     int mtp_draft() const { return mtp_on_ ? draft_ : 0; }
     int mtp_window() const { return mtp_window_; }
+    /// Physical MTP KV ring (0 = full context); equal to the rounded-up --mtp-window when one is set.
+    int mtp_kv_capacity() const { return mtp_kv_capacity_; }
     /// Drafts per step from now on (0 = plain decoding; at most the --mtp value the engine started with).
     void set_mtp_draft(int d) { draft_ = std::clamp(d, 0, opt_.mtp_draft); }
     /// One speculative step.  `tok` is the token just sampled (not fed yet).  Feeds it plus the accepted drafts and
@@ -147,10 +149,15 @@ public:
     int64_t expert_arena_bytes() const { return model_.expert_bytes; }
     const char* kv_type() const { return kv_int8_ ? "int8" : "fp16"; }
     int kv_capacity() const { return kv_capacity_; }
+    /// Physical head stride of a layer; the MTP layer may use a smaller fixed ring (see mtp_kv_capacity_).
+    int kv_stride_for(int il) const {
+        return mtp_kv_capacity_ > 0 && il == model_.cfg.n_layer ? mtp_kv_capacity_ : kv_capacity_;
+    }
     int64_t kv_bytes() const {
         const auto& c = model_.cfg;
-        return (int64_t)(c.n_attn_layers() + c.n_mtp) * 2 * c.n_head_kv * kv_capacity_ *
-               (kv_int8_ ? c.head_dim + 4 : c.head_dim * 2);
+        const int64_t per_token = 2 * c.n_head_kv * (kv_int8_ ? c.head_dim + 4 : c.head_dim * 2);
+        const int64_t mtp_stride = mtp_kv_capacity_ > 0 ? mtp_kv_capacity_ : kv_capacity_;
+        return (int64_t)c.n_attn_layers() * per_token * kv_capacity_ + (int64_t)c.n_mtp * per_token * mtp_stride;
     }
     int cpu_threads() const { return cpu_ ? cpu_->threads() : 0; }
     uint64_t event_graph_steps() const { return event_graph_steps_; }
@@ -338,6 +345,7 @@ private:
     // MTP
     bool mtp_on_ = false;
     int mtp_window_ = 0;                       // sliding MTP attention window (0 = full)
+    int mtp_kv_capacity_ = 0;                  // fixed MTP KV ring size (0 = same full stride as target layers)
     bool mtp_state_only_ = false;              // scoped catch-up mode: retain MTP state, skip its discarded head
     bool mtp_last_row_ = false;                // single full-attention MTP: earlier pending pairs only require KV
     uint64_t mtp_last_row_steps_ = 0, mtp_kv_only_steps_ = 0;
@@ -368,12 +376,14 @@ private:
     struct Checkpoint {
         float* arena = nullptr;               // copy of state_arena_
         float* hin = nullptr;                 // copy of mtp_hin_ (MTP pending pairs)
+        void* mtp_kv = nullptr;               // pinned copy of the MTP KV ring (needed to rewind a wrapped ring)
         int mtp_k = 0;
         std::vector<int> tokens;              // the tokens it covers
         uint64_t stamp = 0;                   // LRU
     };
     std::vector<Checkpoint> ckpts_;
     bool ckpt_host_ = true;                   // checkpoint state lives in pinned host memory, not VRAM
+    size_t mtp_kv_bytes_ = 0;                 // pinned bytes per checkpoint for the MTP KV ring (0 = none)
     uint64_t ckpt_clock_ = 0;
     int64_t state_floats_ = 0;
     int n_past_ = 0;
