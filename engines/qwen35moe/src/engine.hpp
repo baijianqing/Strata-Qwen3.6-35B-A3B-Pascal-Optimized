@@ -47,6 +47,7 @@ struct EngineOptions {
     double profile_weight = 1.0;    // loaded profile vs live routing counts (see setup_cache)
     int ckpt_slots = 3;              // prefix-reuse checkpoints (~66 MiB each); 0 = no checkpoints
     int mtp_draft = 3;               // speculative tokens drafted per step by the MTP block (0 = off; max kMaxT - 1)
+    int mtp_window = 0;              // MTP attention window in keys (0 = full context); target layers are unchanged
     float draft_p = 0.8f;            // keep drafting while the MTP's probability of all drafts so far is >= this
                                      // (half of it for the first draft; below that the step is a plain one)
     bool verbose = false;
@@ -112,6 +113,7 @@ public:
     /// True when the MTP block is loaded and drafting is on.
     bool mtp() const { return mtp_on_; }
     int mtp_draft() const { return mtp_on_ ? draft_ : 0; }
+    int mtp_window() const { return mtp_window_; }
     /// Drafts per step from now on (0 = plain decoding; at most the --mtp value the engine started with).
     void set_mtp_draft(int d) { draft_ = std::clamp(d, 0, opt_.mtp_draft); }
     /// One speculative step.  `tok` is the token just sampled (not fed yet).  Feeds it plus the accepted drafts and
@@ -335,6 +337,7 @@ private:
     float *logits_ = nullptr, *d_sg_ = nullptr, *cand_tmp_ = nullptr;
     // MTP
     bool mtp_on_ = false;
+    int mtp_window_ = 0;                       // sliding MTP attention window (0 = full)
     bool mtp_state_only_ = false;              // scoped catch-up mode: retain MTP state, skip its discarded head
     bool mtp_last_row_ = false;                // single full-attention MTP: earlier pending pairs only require KV
     uint64_t mtp_last_row_steps_ = 0, mtp_kv_only_steps_ = 0;

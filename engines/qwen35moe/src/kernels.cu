@@ -1090,8 +1090,12 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(const float* __restric
     __shared__ float sm[8], sl[8], sscale[8];
     const int split = blockIdx.x, kh = blockIdx.y, t = threadIdx.x, tk = blockIdx.z;
     const int L = P->pos + tk + 1;
-    const int chunk = attn_chunk(L);
-    const int j0 = split * chunk;
+    // Sliding window for the MTP layer: only the last kv_window keys are read.  The KV cache and writes stay
+    // unchanged; the target layers pass 0 and keep the exact full-context path.
+    const int wstart = P->kv_window > 0 ? max(0, L - P->kv_window) : 0;
+    const int nkeys = L - wstart;
+    const int chunk = attn_chunk(nkeys);
+    const int j0 = wstart + split * chunk;
     if (j0 >= L) return;
     q += tk * kNH * kHD;
     part_o += (size_t)tk * kNH * kAttSplits * kHD;
@@ -1182,8 +1186,10 @@ __global__ void __launch_bounds__(256) attn_combine_kernel(const float* __restri
     constexpr int max_splits = kAttSplits;
     const int h = blockIdx.x, t = threadIdx.x, tk = blockIdx.y;
     const int L = P->pos + tk + 1;
-    const int chunk = attn_chunk(L);
-    const int ns = (L + chunk - 1) / chunk;
+    const int wstart = P->kv_window > 0 ? max(0, L - P->kv_window) : 0;
+    const int nkeys = L - wstart;
+    const int chunk = attn_chunk(nkeys);
+    const int ns = (nkeys + chunk - 1) / chunk;
     part_o += (size_t)tk * kNH * max_splits * kHD;
     part_ml += (size_t)tk * kNH * max_splits * 2;
     qkv += tk * kQKV;

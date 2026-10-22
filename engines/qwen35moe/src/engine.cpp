@@ -234,6 +234,9 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
     SQ_CHECK(!prompt_full_graph_ || (!model_.cpu_lm_head && !opt_.use_graph),
              "STRATA_PROMPT_FULL_GRAPH requires a GPU LM head and uncaptured ordinary decode/MTP steps");
     mtp_on_ = c.n_mtp > 0 && opt_.mtp_draft > 0;
+    mtp_window_ = std::clamp(opt_.mtp_window, 0, opt_.ctx);
+    if (mtp_on_ && mtp_window_ > 0)
+        log("MTP attention window: last %d keys (target layers remain full context)", mtp_window_);
     if (mtp_last_row_) {
         SQ_CHECK(mtp_on_ && c.n_mtp == 1 && model_.layers[c.n_layer].attn && !opt_.use_graph,
                  "STRATA_MTP_LAST_ROW requires one full-attention MTP layer and uncaptured MTP steps");
@@ -1428,6 +1431,7 @@ void Engine::build_layer(cudaStream_t s, int il, int T, const StepParams* P, con
             mtp_tail_host_->pos = mparams_host_->pos + last;
             mtp_tail_host_->seq = mparams_host_->seq;
             mtp_tail_host_->n_tok = 1;
+            mtp_tail_host_->kv_window = mparams_host_->kv_window;
             mtp_tail_host_->token[0] = mparams_host_->token[last];
             CUDA_CHECK(cudaMemcpyAsync(mtp_tail_dev_, mtp_tail_host_, step_params_bytes(0), cudaMemcpyHostToDevice, s));
             P = mtp_tail_dev_;
@@ -1983,6 +1987,7 @@ int Engine::mtp_catch_up(int next, bool need_draft, bool defer_completion) {
     const int q = n_past_ - k;
     StepParams& P = *mparams_host_;
     P.pos = q;
+    P.kv_window = mtp_window_;
     for (int j = 0; j < k; ++j) {
         // pair j: hidden state of position q + j, token of position q + j + 1
         const int t = q + j + 1 < n_past_ ? history_[q + j + 1] : next;
@@ -2020,6 +2025,7 @@ int Engine::mtp_recur(int prev_draft, int pos) {
     CUDA_CHECK(cudaMemcpyAsync(mtp_hin_, mtp_hlast_, (size_t)model_.cfg.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
     StepParams& P = *mparams_host_;
     P.pos = pos;
+    P.kv_window = mtp_window_;
     P.token[0] = prev_draft;
     model_.embed(prev_draft, P.emb[0]);
     run_step(true, 1);

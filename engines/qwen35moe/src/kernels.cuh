@@ -33,7 +33,7 @@ struct alignas(16) StepParams {
     int32_t pos;       // position of the first token
     uint32_t seq;      // step sequence number (mailbox handshake)
     int32_t n_tok;
-    int32_t _pad;
+    int32_t kv_window; // MTP sliding attention window in keys (0 = full context; target layers always 0)
     int32_t token[kMaxT];
     float emb[kMaxT][2048];   // the tokens' embedding rows (only the first n_tok are copied)
 };

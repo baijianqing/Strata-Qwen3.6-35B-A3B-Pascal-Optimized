@@ -710,7 +710,8 @@ constexpr size_t attn_smem() {
 template <int AQ, bool SHARE_KV = false>
 __global__ void __launch_bounds__(256) attn_prefill_kernel(const __half* __restrict__ Qh, const __half* __restrict__ kc,
                                                            const __half* __restrict__ vc, int T, int p0, int max_ctx,
-                                                           const float* __restrict__ qkv, int ld, __half* __restrict__ out) {
+                                                           int kv_window, const float* __restrict__ qkv, int ld,
+                                                           __half* __restrict__ out) {
     constexpr int kAQ = AQ, kAR = AQ * 8;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __half* sQ = (__half*)smem_raw;                          // [64][256]
@@ -740,9 +741,12 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(const __half* __restr
         for (int b = 0; b < 8; ++b) acc[a][b] = 0.0f;
     const int last_pos = p0 + tq0 + nq - 1;
     const int n_keys = last_pos + 1;
+    // MTP sliding window: start at the earliest key needed by this query tile.  Main layers pass 0.
+    const int wstart = kv_window > 0 ? max(0, p0 + tq0 - kv_window) : 0;
+    const int k_begin = (wstart / kAK) * kAK;
     // score micro-tile: rows (rp*2, rp*2+1), keys kq*4 .. kq*4+3
     const int rp = tid >> 3, kq = tid & 7;
-    for (int k0 = 0; k0 < n_keys; k0 += kAK) {
+    for (int k0 = k_begin; k0 < n_keys; k0 += kAK) {
         __syncthreads();
         for (int i = tid; i < kAK * kHD / 8; i += AQ * 32) {
             const int j = i / (kHD / 8), c8 = i % (kHD / 8);
@@ -777,7 +781,8 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(const __half* __restr
 #pragma unroll
                 for (int u = 0; u < 4; ++u) {
                     const int kp = k0 + kq * 4 + u;
-                    sS[r * kAK + kq * 4 + u] = (kp <= qpos && (r >> 3) < nq) ? s[a][u] : -INFINITY;
+                    sS[r * kAK + kq * 4 + u] = (kp <= qpos && (kv_window == 0 || kp > qpos - kv_window) &&
+                                                (r >> 3) < nq) ? s[a][u] : -INFINITY;
                 }
             }
         }
@@ -867,24 +872,26 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(const __half* __restr
 
 template <int AQ, bool SHARE_KV = false>
 void launch_attn_variant(const __half* q, const __half* k, const __half* v, int T, int p0, int max_ctx,
-                         const float* qkv, int ld, __half* out, cudaStream_t stream) {
+                         int kv_window, const float* qkv, int ld, __half* out, cudaStream_t stream) {
     attn_prefill_kernel<AQ, SHARE_KV><<<dim3((T + AQ - 1) / AQ, kNKV), AQ * 32,
-                                      attn_smem<AQ, SHARE_KV>(), stream>>>(q, k, v, T, p0, max_ctx, qkv, ld, out);
+                                      attn_smem<AQ, SHARE_KV>(), stream>>>(q, k, v, T, p0, max_ctx, kv_window,
+                                                                           qkv, ld, out);
 }
 
 // Both the prepared main-layer path and ordinary/MTP path use this dispatcher.
 void launch_attn_prefill(bool shared_kv, int aq, const __half* q, const __half* k, const __half* v,
-                        int T, int p0, int max_ctx, const float* qkv, int ld, __half* out, cudaStream_t stream) {
+                        int T, int p0, int max_ctx, int kv_window, const float* qkv, int ld, __half* out,
+                        cudaStream_t stream) {
     if (!shared_kv) {
-        if (aq == 2) launch_attn_variant<2>(q, k, v, T, p0, max_ctx, qkv, ld, out, stream);
-        else launch_attn_variant<8>(q, k, v, T, p0, max_ctx, qkv, ld, out, stream);
+        if (aq == 2) launch_attn_variant<2>(q, k, v, T, p0, max_ctx, kv_window, qkv, ld, out, stream);
+        else launch_attn_variant<8>(q, k, v, T, p0, max_ctx, kv_window, qkv, ld, out, stream);
         return;
     }
     switch (aq) {
-        case 2: launch_attn_variant<2, true>(q, k, v, T, p0, max_ctx, qkv, ld, out, stream); break;
-        case 3: launch_attn_variant<3, true>(q, k, v, T, p0, max_ctx, qkv, ld, out, stream); break;
-        case 4: launch_attn_variant<4, true>(q, k, v, T, p0, max_ctx, qkv, ld, out, stream); break;
-        case 6: launch_attn_variant<6, true>(q, k, v, T, p0, max_ctx, qkv, ld, out, stream); break;
+        case 2: launch_attn_variant<2, true>(q, k, v, T, p0, max_ctx, kv_window, qkv, ld, out, stream); break;
+        case 3: launch_attn_variant<3, true>(q, k, v, T, p0, max_ctx, kv_window, qkv, ld, out, stream); break;
+        case 4: launch_attn_variant<4, true>(q, k, v, T, p0, max_ctx, kv_window, qkv, ld, out, stream); break;
+        case 6: launch_attn_variant<6, true>(q, k, v, T, p0, max_ctx, kv_window, qkv, ld, out, stream); break;
         default: SQ_CHECK(false, "invalid shared-KV attention query tile %d", aq);
     }
 }
@@ -911,6 +918,7 @@ struct Prefill::Impl {
     int attn_aq = 0;
     bool layer_major = false;
     int layer_tile = 1024;
+    int attn_window = 0;   // sliding attention window for the MTP layer only (0 = full context)
     bool phase_profile = false;   // default-off: count streamed expert bytes, no synchronization
     uint64_t staged_experts = 0, staged_bytes = 0, resident_used = 0;
     // Default-off per-expert row-count diagnostic: buckets 1, 2-4, 5-8, 9-16, >16 routed rows.
@@ -1411,7 +1419,7 @@ void Prefill::mixer_prepared(int il, int T, int p0) {
                 P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il], T, p0, E.kv_capacity_, P.big, ld, P.Y);
         } else {
             launch_attn_prefill(P.shared_attn_kv, P.attn_aq, P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il],
-                                T, p0, E.kv_capacity_, P.big, ld, P.Y, s);
+                                T, p0, E.kv_capacity_, 0, P.big, ld, P.Y, s);
         }
         mark(MixerProfile::ATTN);
         gemm(P.cb, P.W16b, P.Y, P.X, kE, 4096, T, kE, 1.0f);
@@ -1450,7 +1458,7 @@ void Prefill::layer(int il, int T, int p0) {
         attn_prep_rows_kernel<<<dim3(T, kNH + 2 * kNKV), 256, 0, s>>>(P.big, ld, L.q_norm, L.k_norm, eps, p0, c.rope_base,
                                                                       P.Qh, (__half*)E.kc_[il], (__half*)E.vc_[il], E.kv_capacity_);
         launch_attn_prefill(P.shared_attn_kv, P.attn_aq, P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il],
-                            T, p0, E.kv_capacity_, P.big, ld, P.Y, s);
+                            T, p0, E.kv_capacity_, P.attn_window, P.big, ld, P.Y, s);
         dequant_q8(L.wo, P.W16, s);
         gemm(P.cb, P.W16, P.Y, P.X, kE, 4096, T, kE, 1.0f);
     }
@@ -1662,7 +1670,9 @@ void Prefill::mtp(const int* tokens, int n, int done, int T, int p0) {
     dequant_q8(M.eh_proj, P.W16, s);
     gemm(P.cb, P.W16, P.Y, P.X, kE, 2 * kE, Tm, kE, 0.0f);
     CUDA_CHECK(cudaStreamSynchronize(s));    // emb (pageable) is released below
+    P.attn_window = E.mtp_window();
     layer(c.n_layer, Tm, q);
+    P.attn_window = 0;
 }
 
 void Prefill::run_layer_major(const int* tokens, int n) {

@@ -94,6 +94,7 @@ void usage() {
         "  --mtp-draft N      speculative decoding: up to N tokens drafted per step by the MTP block (default 3,\n"
         "                     max 3; 0 = off and the MTP block is not loaded; also --mtp)\n"
         "  --draft-p P        keep drafting while the MTP's probability of the drafts so far is >= P (default 0.8)\n"
+        "  --mtp-window N     MTP attends to the last N keys (0 = full context; target layers are unchanged)\n"
         "  --eos-ids a,b      end-of-turn token ids for --serve (default 248044,248046)\n"
         "  --ids a,b,c|@file -n N   generation from token ids (greedy unless --temp)\n"
         "  --temp T --top-k K --top-p P --pres X --seed S   sampling for --ids / --bench\n"
@@ -639,6 +640,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--no-pin") opt.pin_threads = false;
         else if (a == "--mtp-model") opt.mtp_model_path = next();
+        else if (a == "--mtp-window") opt.mtp_window = std::stoi(next());
         else if (a == "--mtp" || a == "--mtp-draft") opt.mtp_draft = std::stoi(next());
         else if (a == "--no-mtp") opt.mtp_draft = 0;
         else if (a == "--draft-p") opt.draft_p = std::stof(next());
