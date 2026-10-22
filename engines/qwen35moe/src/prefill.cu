@@ -919,6 +919,8 @@ struct Prefill::Impl {
     bool shared_attn_kv = false;
     bool attn_bank_layout = false;
     bool attn_ss_pad = false;   // pad the score-row pitch by one float to remove bank conflicts
+    bool attn_q_global = false; // read Q from global/L1 instead of shared, allowing two blocks per SM
+    int attn_qg_aq = 6;         // query tile for the Q_GLOBAL layout kernel (6 or 8)
     int attn_aq = 0;
     bool layer_major = false;
     int layer_tile = 1024;
@@ -1252,15 +1254,25 @@ bool Prefill::init(std::string& err, int tile_override) {
         P.attn_bank_layout = P.layer_major && P.shared_attn_kv && P.attn_aq == 6;
         if (P.attn_bank_layout) {
             if (const char* v = std::getenv("STRATA_PREFILL_ATTN_SS_PAD")) P.attn_ss_pad = std::atoi(v) != 0;
+            if (const char* v = std::getenv("STRATA_PREFILL_ATTN_Q_GLOBAL")) P.attn_q_global = std::atoi(v) != 0;
+            if (const char* v = std::getenv("STRATA_PREFILL_ATTN_QG_AQ")) P.attn_qg_aq = std::atoi(v);
+            SQ_CHECK(P.attn_qg_aq == 6 || P.attn_qg_aq == 8, "STRATA_PREFILL_ATTN_QG_AQ must be 6 or 8");
             constexpr size_t bytes = attn_layout_smem<6, true, true, true>();
             constexpr size_t bytes_pad = attn_layout_smem<6, true, true, true, 1>();
+            constexpr size_t bytes_qg6 = attn_layout_smem<6, true, false, true, 1, true>();
+            constexpr size_t bytes_qg8 = attn_layout_smem<8, true, false, true, 1, true>();
             static_assert(bytes == 48960, "AQ6 bank-layout shared memory changed");
-            SQ_CHECK(192 <= prop.maxThreadsPerBlock && 192 <= prop.maxThreadsDim[0],
-                     "AQ6 bank-layout attention needs 192 threads per block");
-            const size_t use_bytes = P.attn_ss_pad ? bytes_pad : bytes;
+            const int threads = P.attn_q_global && P.attn_qg_aq == 8 ? 256 : 192;
+            SQ_CHECK(threads <= prop.maxThreadsPerBlock && threads <= prop.maxThreadsDim[0],
+                     "AQ%d bank-layout attention needs %d threads per block", P.attn_q_global ? P.attn_qg_aq : 6,
+                     threads);
+            const size_t bytes_qg = P.attn_qg_aq == 8 ? bytes_qg8 : bytes_qg6;
+            const size_t use_bytes = P.attn_q_global ? bytes_qg : (P.attn_ss_pad ? bytes_pad : bytes);
             SQ_CHECK(use_bytes <= shared_limit, "AQ6 bank-layout attention needs %zu bytes, device supports %zu",
                      use_bytes, shared_limit);
-            if (P.attn_ss_pad) {
+            if (P.attn_q_global) {
+                // ~24-26 KiB: no opt-in shared attribute; two blocks can reside on one SM.
+            } else if (P.attn_ss_pad) {
                 if (bytes_pad > prop.sharedMemPerBlock)
                     CUDA_CHECK(cudaFuncSetAttribute(attn_layout_kernel<6, true, true, true, 1>,
                                                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes_pad));
@@ -1268,8 +1280,10 @@ bool Prefill::init(std::string& err, int tile_override) {
                 CUDA_CHECK(cudaFuncSetAttribute(attn_layout_kernel<6, true, true, true>,
                                                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
             }
-            log("prompt attention: AQ6 bank layout, %zu bytes shared memory (+768), SS_PAD %d, "
-                "no additional global VRAM; prepared main layers only", use_bytes, P.attn_ss_pad ? 1 : 0);
+            log("prompt attention: AQ%d bank layout, %zu bytes shared memory (+768), SS_PAD %d, Q_GLOBAL %d, "
+                "no additional global VRAM; prepared main layers only",
+                P.attn_q_global ? P.attn_qg_aq : 6, use_bytes, P.attn_q_global ? 1 : (P.attn_ss_pad ? 1 : 0),
+                P.attn_q_global ? 1 : 0);
         } else {
             log("prompt attention bank layout not enabled: requires layer-major prefill with shared K/V and AQ6");
         }
@@ -1429,7 +1443,15 @@ void Prefill::mixer_prepared(int il, int T, int p0) {
                                                                       (__half*)E.vc_[il], E.kv_capacity_);
         mark(MixerProfile::ATTN_PREP);
         if (P.attn_bank_layout && il < c.n_layer) {
-            if (P.attn_ss_pad)
+            if (P.attn_q_global && P.attn_qg_aq == 8)
+                attn_layout_kernel<8, true, false, true, 1, true><<<dim3((T + 7) / 8, kNKV), 256,
+                                                                   attn_layout_smem<8, true, false, true, 1, true>(), s>>>(
+                    P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il], T, p0, E.kv_capacity_, P.big, ld, P.Y);
+            else if (P.attn_q_global)
+                attn_layout_kernel<6, true, false, true, 1, true><<<dim3((T + 5) / 6, kNKV), 192,
+                                                                   attn_layout_smem<6, true, false, true, 1, true>(), s>>>(
+                    P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il], T, p0, E.kv_capacity_, P.big, ld, P.Y);
+            else if (P.attn_ss_pad)
                 attn_layout_kernel<6, true, true, true, 1><<<dim3((T + 5) / 6, kNKV), 192,
                                                             attn_layout_smem<6, true, true, true, 1>(), s>>>(
                     P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il], T, p0, E.kv_capacity_, P.big, ld, P.Y);

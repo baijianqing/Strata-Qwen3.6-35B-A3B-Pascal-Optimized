@@ -1,14 +1,16 @@
 // Isolated exact-layout experiment; include after accepted constants/helpers.
 #pragma once
 // PAD_Q changes shared Q pitch only. PERMUTE_K changes score ownership, not softmax/key order.
-template <int AQ, bool SHARE_KV = false, bool PAD_Q = false, bool PERMUTE_K = false, int SS_PAD = 0>
+template <int AQ, bool SHARE_KV = false, bool PAD_Q = false, bool PERMUTE_K = false, int SS_PAD = 0,
+          bool Q_GLOBAL = false>
 constexpr size_t attn_layout_smem() {
     constexpr int AR = AQ * 8;
-    return (size_t)AR * (kHD + (PAD_Q ? 8 : 0)) * 2 + (size_t)kAK * kKPad * 2 + (SHARE_KV ? 0 : (size_t)kAK * kHD * 2) +
-           (size_t)AR * (kAK + SS_PAD) * 4 + 3 * AR * 4;
+    return (Q_GLOBAL ? 0 : (size_t)AR * (kHD + (PAD_Q ? 8 : 0)) * 2) + (size_t)kAK * kKPad * 2 +
+           (SHARE_KV ? 0 : (size_t)kAK * kHD * 2) + (size_t)AR * (kAK + SS_PAD) * 4 + 3 * AR * 4;
 }
 
-template <int AQ, bool SHARE_KV = false, bool PAD_Q = false, bool PERMUTE_K = false, int SS_PAD = 0>
+template <int AQ, bool SHARE_KV = false, bool PAD_Q = false, bool PERMUTE_K = false, int SS_PAD = 0,
+          bool Q_GLOBAL = false>
 __global__ void __launch_bounds__(256) attn_layout_kernel(const __half* __restrict__ Qh, const __half* __restrict__ kc,
                                                            const __half* __restrict__ vc, int T, int p0, int max_ctx,
                                                            const float* __restrict__ qkv, int ld, __half* __restrict__ out) {
@@ -16,8 +18,10 @@ __global__ void __launch_bounds__(256) attn_layout_kernel(const __half* __restri
     constexpr int kQStride = kHD + (PAD_Q ? 8 : 0);
     constexpr int kSS = kAK + SS_PAD;   // score-row pitch: +1 removes same-bank rows in softmax/score
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    __half* sQ = (__half*)smem_raw;                          // [64][256]
-    __half* sK = sQ + kAR * kQStride;                              // [32][264]
+    __half* sQ = (__half*)smem_raw;
+    __half* sK;
+    if constexpr (Q_GLOBAL) sK = (__half*)smem_raw;
+    else sK = sQ + kAR * kQStride;
     __half* sV = SHARE_KV ? sK : sK + kAK * kKPad;             // [32][256], optionally aliases K
     float* sS = (float*)(SHARE_KV ? sK + kAK * kKPad : sV + kAK * kHD); // after max(K,V) when shared
     float* sM = sS + kAR * kSS;                               // [64] running max
@@ -25,13 +29,16 @@ __global__ void __launch_bounds__(256) attn_layout_kernel(const __half* __restri
     float* sA = sL + kAR;                                     // [64] rescale factor
     const int kh = blockIdx.y, tq0 = blockIdx.x * kAQ, tid = threadIdx.x;
     const int nq = min(kAQ, T - tq0);
-    // load Q rows: r = tok*8 + h  ->  Qh[tq0+tok][kh*8+h]
-    for (int i = tid; i < kAR * kHD / 8; i += AQ * 32) {
-        const int r = i / (kHD / 8), c8 = i % (kHD / 8);
-        const int tok = r >> 3, h = r & 7;
-        int4 v = make_int4(0, 0, 0, 0);
-        if (tok < nq) v = *(const int4*)(Qh + ((size_t)(tq0 + tok) * kNH + kh * 8 + h) * kHD + c8 * 8);
-        *(int4*)(sQ + r * kQStride + c8 * 8) = v;
+    // Q stays in shared by default; Q_GLOBAL reads the same rows from Qh so the arithmetic is unchanged and
+    // shared usage drops enough for two blocks per SM.
+    if constexpr (!Q_GLOBAL) {
+        for (int i = tid; i < kAR * kHD / 8; i += AQ * 32) {
+            const int r = i / (kHD / 8), c8 = i % (kHD / 8);
+            const int tok = r >> 3, h = r & 7;
+            int4 v = make_int4(0, 0, 0, 0);
+            if (tok < nq) v = *(const int4*)(Qh + ((size_t)(tq0 + tok) * kNH + kh * 8 + h) * kHD + c8 * 8);
+            *(int4*)(sQ + r * kQStride + c8 * 8) = v;
+        }
     }
     if (tid < kAR) { sM[tid] = -INFINITY; sL[tid] = 0.0f; }
     // output accumulators: thread -> rows rg*8 .. rg*8+7 (rg = warp), dims lane*8 .. lane*8+7
@@ -61,8 +68,18 @@ __global__ void __launch_bounds__(256) attn_layout_kernel(const __half* __restri
         __syncthreads();
         {
             float s[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
-            const __half2* q0 = (const __half2*)(sQ + (rp * 2) * kQStride);
-            const __half2* q1 = (const __half2*)(sQ + (rp * 2 + 1) * kQStride);
+            const int r0 = rp * 2, r1 = r0 + 1;
+            const __half2* q0;
+            const __half2* q1;
+            if constexpr (Q_GLOBAL) {
+                // Same Q values as the shared copy; clamp the tail rows so an out-of-range tile never faults.
+                const int t0 = min(r0 >> 3, nq - 1), t1 = min(r1 >> 3, nq - 1);
+                q0 = (const __half2*)(Qh + ((size_t)(tq0 + t0) * kNH + kh * 8 + (r0 & 7)) * kHD);
+                q1 = (const __half2*)(Qh + ((size_t)(tq0 + t1) * kNH + kh * 8 + (r1 & 7)) * kHD);
+            } else {
+                q0 = (const __half2*)(sQ + r0 * kQStride);
+                q1 = (const __half2*)(sQ + r1 * kQStride);
+            }
 #pragma unroll 8
             for (int d2 = 0; d2 < kHD / 2; ++d2) {
                 const float2 a0 = __half22float2(q0[d2]), a1 = __half22float2(q1[d2]);
