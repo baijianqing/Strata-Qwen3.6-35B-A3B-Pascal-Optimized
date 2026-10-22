@@ -2197,14 +2197,31 @@ void Engine::feed(const int* tokens, int n) {
             CUDA_CHECK(cudaStreamSynchronize(stream_));
             CUDA_CHECK(cudaStreamSynchronize(copy_stream_));   // drain adaptive uploads; no cache change
             mark(pt.trim_ms);
+            int64_t snapshot_lent = 0;
+            if (prefill_snapshot_loan_ && snap_arena_) {
+                snapshot_lent = (size_t)opt_.mtp_draft * state_floats_ * sizeof(float);
+                CUDA_CHECK(cudaFree(snap_arena_));
+                snap_arena_ = nullptr;
+            }
+            mark(pt.snapshot_release_ms);
             const int64_t head_lent = model_.release_lm_head();
             mark(pt.head_release_ms);
             size_t free_now = 0, total_now = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_now, &total_now));
-            // The 128 MiB window reserve plus the C=512 workspace (~220 MiB) needs a conservative margin.
-            // Elsewhere (CPU LM head, larger models) fall back to the full borrow path.
-            if (free_now >= (size_t)448 * 1048576) {
-                const int tile = ((n + 127) / 128) * 128;
+            // Size the guard per tile: measured workspace ~160 MiB at C=128 plus ~0.22 MiB/row, the window
+            // state ~0.087 MiB/token, and run_layer_major's 128 MiB reserve.  A 10% workspace margin keeps the
+            // allocation from aborting on a tighter card; a prompt that cannot fit falls back to the full
+            // borrow path, which trims the cache first.
+            // Power-of-two tiles divide the configured 8192-row window; a 384-row tile would trip its
+            // multiple-of-tile guard.  The short path only handles prompts up to prefill_short_max_.
+            int tile = 128;
+            while (tile < n) tile *= 2;
+            tile = std::min(tile, 2048);
+            const double need_mib = 1.1 * (160.0 + 0.22 * (tile - 128)) + 0.087 * tile + 128.0;
+            if (phase_switch_profile_)
+                log("SHORT_PREFILL_FREE tokens=%d free_after_head=%.1f MiB need=%.1f MiB",
+                    n, free_now / 1048576.0, need_mib);
+            if (free_now >= (size_t)(need_mib * 1048576.0)) {
                 note_path("short", tile);
                 prefill_ = std::make_unique<Prefill>(*this);
                 std::string prefill_error;
@@ -2221,6 +2238,10 @@ void Engine::feed(const int* tokens, int n) {
                     CUDA_CHECK(cudaStreamSynchronize(stream_));
                 }
                 mark(pt.head_restore_ms);
+                if (snapshot_lent > 0) {
+                    CUDA_CHECK(cudaMalloc(&snap_arena_, (size_t)snapshot_lent));
+                }
+                mark(pt.snapshot_alloc_ms);
                 fold_route_counts();
                 mark(pt.refill_ms);
                 stats.prefill_ms += now_ms() - t0;
@@ -2232,15 +2253,17 @@ void Engine::feed(const int* tokens, int n) {
                     pt.total_ms = now_ms() - t0;
                     pt.slots = cache_slots_total_;
                     log("SHORT_PREFILL_PROFILE tokens=%d tile=%d slots=%lld kv=%.2f drain=%.2f "
-                        "head_release=%.2f init=%.2f run=%.2f teardown=%.2f head_restore=%.2f "
-                        "route_fold=%.2f total=%.2f ms", pt.tokens, tile, (long long)pt.slots, pt.kv_ms,
-                        pt.trim_ms, pt.head_release_ms, pt.init_ms, pt.run_ms, pt.teardown_ms,
-                        pt.head_restore_ms, pt.refill_ms, pt.total_ms);
+                        "snapshot_release=%.2f head_release=%.2f init=%.2f run=%.2f teardown=%.2f "
+                        "head_restore=%.2f snapshot_alloc=%.2f route_fold=%.2f total=%.2f ms",
+                        pt.tokens, tile, (long long)pt.slots, pt.kv_ms, pt.trim_ms, pt.snapshot_release_ms,
+                        pt.head_release_ms, pt.init_ms, pt.run_ms, pt.teardown_ms, pt.head_restore_ms,
+                        pt.snapshot_alloc_ms, pt.refill_ms, pt.total_ms);
                 }
                 return;
             }
-            // Not enough headroom: restore the head and take the full borrow path below.
+            // Not enough headroom: restore the head and rollback arena and take the full borrow path below.
             if (head_lent > 0) model_.restore_lm_head();
+            if (snapshot_lent > 0) CUDA_CHECK(cudaMalloc(&snap_arena_, (size_t)snapshot_lent));
             pt = PhaseSwitchTiming{};
             pt.tokens = n;
             tp = now_ms();
