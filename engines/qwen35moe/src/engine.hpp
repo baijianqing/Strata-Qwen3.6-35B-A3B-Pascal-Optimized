@@ -373,6 +373,7 @@ private:
         uint64_t stamp = 0;                   // LRU
     };
     std::vector<Checkpoint> ckpts_;
+    bool ckpt_host_ = true;                   // checkpoint state lives in pinned host memory, not VRAM
     uint64_t ckpt_clock_ = 0;
     int64_t state_floats_ = 0;
     int n_past_ = 0;

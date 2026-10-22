@@ -94,6 +94,10 @@ Engine::~Engine() {
     for (auto& layer : pipeline_layers_)
         for (auto event : layer.event) if (event) cudaEventDestroy(event);
     if (pipeline_end_) cudaEventDestroy(pipeline_end_);
+    for (auto& ck : ckpts_) {
+        if (ck.arena) { if (ckpt_host_) cudaFreeHost(ck.arena); else cudaFree(ck.arena); }
+        if (ck.hin) { if (ckpt_host_) cudaFreeHost(ck.hin); else cudaFree(ck.hin); }
+    }
     if (cache_upload_host_) cudaFreeHost(cache_upload_host_);
     if (cache_residency_host_) cudaFreeHost(cache_residency_host_);
     if (router_mb_dev_) cudaFree(router_mb_dev_);
@@ -490,10 +494,21 @@ void Engine::alloc_state() {
     state_floats_ = (conv_f + ssm_f) * c.n_gdn_layers();
     state_arena_ = dmalloc<float>(state_floats_);
     ckpts_.resize(std::max(opt_.ckpt_slots, 0));
+    ckpt_host_ = env_mib("STRATA_CKPT_HOST", 1, 1) != 0;
     for (auto& ck : ckpts_) {
-        ck.arena = dmalloc<float>(state_floats_);
-        ck.hin = dmalloc<float>((size_t)kMaxT * c.n_embd);
+        if (ckpt_host_) {
+            CUDA_CHECK(cudaHostAlloc((void**)&ck.arena, state_floats_ * sizeof(float), cudaHostAllocDefault));
+            CUDA_CHECK(cudaHostAlloc((void**)&ck.hin, (size_t)kMaxT * c.n_embd * sizeof(float),
+                                     cudaHostAllocDefault));
+        } else {
+            ck.arena = dmalloc<float>(state_floats_);
+            ck.hin = dmalloc<float>((size_t)kMaxT * c.n_embd);
+        }
     }
+    if (!ckpts_.empty())
+        log("checkpoint storage: %zu slot(s) in %s memory (%.0f MiB %s)", ckpts_.size(),
+            ckpt_host_ ? "pinned host" : "device", ckpts_.size() * state_floats_ * 4 / 1048576.0,
+            ckpt_host_ ? "VRAM saved" : "VRAM used");
     int64_t off = 0;
     for (int il = 0; il < NL; ++il) {
         if (c.is_attn(il)) {
@@ -2519,8 +2534,9 @@ int Engine::reuse_prefix(const std::vector<int>& prompt) {
         reset();
         return report(0);
     }
-    CUDA_CHECK(cudaMemcpyAsync(state_arena_, pick->arena, state_floats_ * 4, cudaMemcpyDeviceToDevice, stream_));
-    CUDA_CHECK(cudaMemcpyAsync(mtp_hin_, pick->hin, (size_t)kMaxT * model_.cfg.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
+    const cudaMemcpyKind from_ckpt = ckpt_host_ ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
+    CUDA_CHECK(cudaMemcpyAsync(state_arena_, pick->arena, state_floats_ * 4, from_ckpt, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(mtp_hin_, pick->hin, (size_t)kMaxT * model_.cfg.n_embd * 4, from_ckpt, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     pick->stamp = ++ckpt_clock_;
     history_ = pick->tokens;
@@ -2546,8 +2562,9 @@ void Engine::save_checkpoint(bool base) {
     if (!base || ckpts_.size() == 1)
         for (size_t i = first; i < ckpts_.size(); ++i)
             if (ckpts_[i].stamp < slot->stamp) slot = &ckpts_[i];
-    CUDA_CHECK(cudaMemcpyAsync(slot->arena, state_arena_, state_floats_ * 4, cudaMemcpyDeviceToDevice, stream_));
-    CUDA_CHECK(cudaMemcpyAsync(slot->hin, mtp_hin_, (size_t)kMaxT * model_.cfg.n_embd * 4, cudaMemcpyDeviceToDevice, stream_));
+    const cudaMemcpyKind to_ckpt = ckpt_host_ ? cudaMemcpyDeviceToHost : cudaMemcpyDeviceToDevice;
+    CUDA_CHECK(cudaMemcpyAsync(slot->arena, state_arena_, state_floats_ * 4, to_ckpt, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(slot->hin, mtp_hin_, (size_t)kMaxT * model_.cfg.n_embd * 4, to_ckpt, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     slot->tokens = history_;
     slot->mtp_k = mtp_k_;
