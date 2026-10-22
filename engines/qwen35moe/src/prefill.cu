@@ -639,12 +639,75 @@ __global__ void __launch_bounds__(128) gdn_scan_four_columns_kernel(
     }
 }
 
+// Opt-in: load q/k for the block's head once per token into shared memory.  The original four-column kernel
+// reloads the same q/k in every warp (and every column group), which dominates the scan's global traffic.
+template <int WARPS>
+__global__ void __launch_bounds__(WARPS * 32) gdn_scan_shared_kernel(
+        const float* __restrict__ conv, const float* __restrict__ gb,
+        float* __restrict__ state, float* __restrict__ o, int T) {
+    constexpr int C = 4;
+    static_assert(kDS % (WARPS * C) == 0, "GDN shared block must cover complete state columns");
+    const int h = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int first = (blockIdx.y * WARPS + warp) * C, kh = h % kKH;
+    __shared__ float sq[kDS], sk[kDS];
+    float s[C][4];
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+        const float* S = state + ((size_t)h * kDS + first + c) * kDS;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) s[c][i] = S[lane + 32 * i];
+    }
+    for (int t = 0; t < T; ++t) {
+        // The previous token's readers must finish before the q/k tile is overwritten.
+        __syncthreads();
+        const float* ct = conv + (size_t)t * kConv;
+        for (int i = threadIdx.x; i < kDS; i += WARPS * 32) {
+            sq[i] = ct[kh * kDS + i];
+            sk[i] = ct[kKH * kDS + kh * kDS + i];
+        }
+        __syncthreads();
+        const float decay = gb[t * 64 + h], beta = gb[t * 64 + kVH + h];
+        for (int c = 0; c < C; ++c) {
+            const int col = first + c;
+            const float v = ct[2 * kKH * kDS + h * kDS + col];
+            float kv = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) kv += s[c][i] * sk[lane + 32 * i];
+            kv = warp_sum(kv);
+            const float delta = (v - decay * kv) * beta;
+            float out = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s[c][i] = decay * s[c][i] + sk[lane + 32 * i] * delta;
+                out += s[c][i] * sq[lane + 32 * i];
+            }
+            out = warp_sum(out);
+            if (lane == 0) o[(size_t)t * (kVH * kDS) + h * kDS + col] = out;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+        float* S = state + ((size_t)h * kDS + first + c) * kDS;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) S[lane + 32 * i] = s[c][i];
+    }
+}
+
 void gdn_scan(const float* conv, const float* gb, float* state, float* out, int T,
               int columns, cudaStream_t stream) {
-    if (columns == 4)
-        gdn_scan_four_columns_kernel<<<dim3(kVH, kDS / 16), 128, 0, stream>>>(conv, gb, state, out, T);
-    else
-        gdn_scan_kernel<<<dim3(kVH, kDS / 4), 128, 0, stream>>>(conv, gb, state, out, T);
+    int warps = 0;
+    if (const char* v = std::getenv("STRATA_PREFILL_GDN_WARPS")) warps = std::atoi(v);
+    switch (warps) {
+        case 4:  gdn_scan_shared_kernel<4><<<dim3(kVH, kDS / 16), 128, 0, stream>>>(conv, gb, state, out, T); break;
+        case 8:  gdn_scan_shared_kernel<8><<<dim3(kVH, kDS / 32), 256, 0, stream>>>(conv, gb, state, out, T); break;
+        case 16: gdn_scan_shared_kernel<16><<<dim3(kVH, kDS / 64), 512, 0, stream>>>(conv, gb, state, out, T); break;
+        case 32: gdn_scan_shared_kernel<32><<<dim3(kVH, kDS / 128), 1024, 0, stream>>>(conv, gb, state, out, T); break;
+        default:
+            if (columns == 4)
+                gdn_scan_four_columns_kernel<<<dim3(kVH, kDS / 16), 128, 0, stream>>>(conv, gb, state, out, T);
+            else
+                gdn_scan_kernel<<<dim3(kVH, kDS / 4), 128, 0, stream>>>(conv, gb, state, out, T);
+    }
 }
 
 /// Y[t][h] = rmsnorm(o[t][h]) * w * silu(z[t][h]) in fp16.  grid (T, 32), 128 threads.
