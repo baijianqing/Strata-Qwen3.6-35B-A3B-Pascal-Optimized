@@ -79,6 +79,25 @@ void GgufFile::close() {
     for (auto& t : tensors_) t.data = nullptr;
 }
 
+void GgufFile::drop_pages(const GgufTensor& t) const {
+#ifndef _WIN32
+    if (!base_ || !t.data || t.bytes <= 0) return;
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return;
+    const uintptr_t begin = (uintptr_t)t.data & ~(uintptr_t)(page - 1);
+    const uintptr_t end = ((uintptr_t)t.data + (uintptr_t)t.bytes + (uintptr_t)page - 1) &
+                          ~(uintptr_t)(page - 1);
+    if (end > begin) madvise((void*)begin, (size_t)(end - begin), MADV_DONTNEED);
+#else
+    (void)t;
+#endif
+}
+
+void GgufFile::drop_pages_except(const std::string& keep) const {
+    for (const auto& t : tensors_)
+        if (t.name != keep) drop_pages(t);
+}
+
 bool GgufFile::open(const std::string& path, std::string& err) {
 #ifdef _WIN32
     const int wn = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);

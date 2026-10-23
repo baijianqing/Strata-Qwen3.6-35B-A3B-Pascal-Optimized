@@ -577,6 +577,15 @@ bool Model::load(const std::string& path, const std::string& mtp_path, bool with
     }
     const double t1 = now_ms();
     log("dense weights on GPU: %.2f GiB (%.1f s)", dense_bytes / 1073741824.0, (t1 - t0) / 1000);
+    // The dense tensors are copied to the GPU by now. Release their file-backed pages so the load does not
+    // accumulate the whole GGUF in this process's working set next to the pinned expert arena. The embedding
+    // stays mapped: it is the one tensor still read per token until it is copied at the end of the load.
+    const char* drop_env = std::getenv("STRATA_LOAD_DROP_PAGES");
+    const bool drop_load_pages = !(drop_env && std::atoi(drop_env) == 0);
+    if (drop_load_pages) {
+        gguf.drop_pages_except("token_embd.weight");
+        if (mtp_sidecar_) mtp_gguf.drop_pages_except("");   // no per-token reads from the sidecar
+    }
 
     // ------------------------------------------------ routed experts -> pinned RAM or a pageable disk cache
     expert_bytes = 0;
@@ -697,6 +706,13 @@ bool Model::load(const std::string& path, const std::string& mtp_path, bool with
             copy_matrix(d, L.t_down, e, dst + 2 * L.gu_bytes);
         });
         if (mapped_cache && !flush_expert_cache_layer(il, err)) return false;
+        if (drop_load_pages) {
+            // This layer's source pages are consumed; keep only the current layer resident while loading.
+            GgufFile& src = (mtp_sidecar_ && il >= c.n_layer) ? mtp_gguf : gguf;
+            src.drop_pages(g);
+            src.drop_pages(u);
+            src.drop_pages(d);
+        }
         log("expert layer %d ready (%.1f s)", il + 1, (now_ms() - layer_start) / 1000);
     }
     // Everything the engine needs from the file is copied now, so the mapping is closed: it would otherwise keep the

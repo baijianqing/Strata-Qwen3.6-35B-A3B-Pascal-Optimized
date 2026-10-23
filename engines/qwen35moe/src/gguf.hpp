@@ -37,6 +37,12 @@ public:
     bool open(const std::string& path, std::string& err);
     /// Unmaps the file (the metadata stays readable; tensor data pointers become null).
     void close();
+    /// Drops one tensor's file-backed pages from this process's working set.  The bytes stay in the page cache
+    /// and are re-read on demand; this only stops a fully consumed load from holding the whole GGUF resident
+    /// next to the pinned expert arena.  No-op on Windows and once the mapping is closed.
+    void drop_pages(const GgufTensor& t) const;
+    /// Drops every mapped tensor's pages except `keep` (e.g. token_embd, which is read per token after load).
+    void drop_pages_except(const std::string& keep) const;
 
     const GgufTensor* tensor(const std::string& name) const;
     const GgufTensor& need(const std::string& name) const;
