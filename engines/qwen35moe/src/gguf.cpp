@@ -96,10 +96,11 @@ bool GgufFile::drop_pages(const GgufTensor& t) const {
 #endif
 }
 
-void GgufFile::drop_pages_except(const std::string& keep) const {
+void GgufFile::drop_pages_except(const std::string& keep, bool keep_experts) const {
     std::string failed;
     for (const auto& t : tensors_) {
         if (t.name == keep) continue;
+        if (keep_experts && t.name.find("_exps.weight") != std::string::npos) continue;
         if (!drop_pages(t) && failed.empty()) failed = t.name;
     }
     if (!failed.empty())

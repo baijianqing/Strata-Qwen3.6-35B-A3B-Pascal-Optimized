@@ -583,8 +583,9 @@ bool Model::load(const std::string& path, const std::string& mtp_path, bool with
     const char* drop_env = std::getenv("STRATA_LOAD_DROP_PAGES");
     const bool drop_load_pages = !(drop_env && std::atoi(drop_env) == 0);
     if (drop_load_pages) {
-        gguf.drop_pages_except("token_embd.weight");
-        if (mtp_sidecar_) mtp_gguf.drop_pages_except("");   // no per-token reads from the sidecar
+        // Expert tensors are still needed by the copy loop below; it releases each layer after use.
+        gguf.drop_pages_except("token_embd.weight", true);
+        if (mtp_sidecar_) mtp_gguf.drop_pages_except("", true);   // no per-token reads from the sidecar
     }
 
     // ------------------------------------------------ routed experts -> pinned RAM or a pageable disk cache

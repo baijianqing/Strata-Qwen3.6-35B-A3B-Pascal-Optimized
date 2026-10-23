@@ -43,8 +43,10 @@ public:
     /// once the mapping is closed.
     bool drop_pages(const GgufTensor& t) const;
     /// Drops every mapped tensor's pages except `keep` (e.g. token_embd, which is read per token after load).
+    /// With `keep_experts`, routed-expert tensors are skipped too: the expert copy loop consumes them later and
+    /// releases each layer after use, so dropping them here would only fault them back in.
     /// Logs once if any call fails; the load stays correct because the pages are only advisory.
-    void drop_pages_except(const std::string& keep) const;
+    void drop_pages_except(const std::string& keep, bool keep_experts = false) const;
 
     const GgufTensor* tensor(const std::string& name) const;
     const GgufTensor& need(const std::string& name) const;
