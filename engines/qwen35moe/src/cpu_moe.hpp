@@ -14,6 +14,7 @@
 #include <atomic>
 #include <memory>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <thread>
 #include <vector>
@@ -90,11 +91,16 @@ struct CpuMoePhaseCounts {
     uint64_t gu_row_pairs = 0, down_row_pairs = 0;
 };
 struct CpuMoePhaseGroup {
+    int kind = 0;                       // 0 = target verification, 1 = MTP draft
     int n_tok = 0;
     uint32_t t_gu = 0, t_down = 0;
     uint64_t jobs = 0, missing_experts = 0, routed_pairs = 0;
     uint64_t expert_nt[kMaxT + 1] = {}; // includes NT0 (zero routing weight), distinct missing experts only
     uint64_t dispatch_to_join_ns = 0, max_worker_ns = 0;
+    uint64_t dispatch_to_first_start_ns = 0; // host dispatch -> first worker enters run_layer
+    uint64_t start_spread_ns = 0;            // first worker start -> last worker start
+    uint64_t dispatch_to_last_end_ns = 0;    // host dispatch -> last worker leaves run_layer
+    uint64_t worker_cpu_ns = 0;              // summed thread CPU time across workers
     CpuMoePhaseCounts workers;
 };
 struct CpuMoePhaseProfile {
@@ -118,6 +124,8 @@ public:
     uint64_t iq3_down_cache_rows() const;
     /// Host-only diagnostic snapshot; read between drained jobs. Only begin_layer/end_layer jobs are sampled.
     const CpuMoePhaseProfile& phase_profile() const { return phase_profile_; }
+    /// Tag the following begin_layer jobs as target verification (0) or MTP draft (1); host-only, between jobs.
+    void set_job_kind(int kind) { job_kind_ = kind; }
 
     /// Run one callback per persistent worker and wait for completion. Called by the sole host scheduler,
     /// between MoE jobs; callbacks must not dispatch nested work or throw. Worker ids are 0..threads()-1.
@@ -160,9 +168,13 @@ private:
     int prompt_completion_spins_ = -1; // STRATA_PROMPT_COMPLETION_SPINS: missing inherits ordinary budget
     bool notify_completion_ = false; // immutable while workers run: either possible waiter can sleep
     bool phase_enabled_ = false, phase_active_ = false, phase_logged_ = false;
-    int phase_layer_ = -1;
-    uint64_t phase_skip_ = 40, phase_limit_ = 400, phase_start_ns_ = 0;
-    struct alignas(64) PhaseWorker { CpuMoePhaseCounts counts; };
+    int phase_layer_ = -1, job_kind_ = 0;
+    uint64_t phase_skip_ = 40, phase_limit_ = 400, phase_start_ns_ = 0, phase_dispatch_ns_ = 0;
+    FILE* phase_trace_fp_ = nullptr;            // STRATA_CPU_PHASE_TRACE: one row per sampled job
+    struct alignas(64) PhaseWorker {
+        CpuMoePhaseCounts counts;
+        uint64_t start_offset_ns = 0, end_offset_ns = 0, cpu_ns = 0;
+    };
     std::unique_ptr<PhaseWorker[]> phase_workers_; // allocated only for opt-in diagnostics, worker-private
     CpuMoePhaseProfile phase_profile_; // host-only, never read or written by workers
     std::vector<ExpertLayerDesc> layers_;

@@ -26,6 +26,7 @@
 #include <cpuid.h>
 #include <pthread.h>
 #include <sched.h>
+#include <time.h>
 #endif
 
 namespace sq {
@@ -36,6 +37,16 @@ namespace {
 uint64_t phase_now_ns() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/// Scheduled CPU time of the calling worker (not wall time), so preemption is separable from compute.
+uint64_t thread_cpu_now_ns() {
+#ifndef _WIN32
+    timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+    return 0;
 }
 
 // Profile=false is an empty scope: the ordinary kernel has no clock calls or counter stores.
@@ -225,12 +236,24 @@ void CpuMoe::start(int n_threads, int n_layer, const std::vector<ExpertLayerDesc
     phase_layer_ = -1;
     phase_profile_ = {};
     phase_workers_.reset();
+    if (phase_trace_fp_) { std::fclose(phase_trace_fp_); phase_trace_fp_ = nullptr; }
+    const char* phase_trace_path = std::getenv("STRATA_CPU_PHASE_TRACE");
+    if (phase_trace_path && *phase_trace_path) phase_enabled_ = true;
     if (phase_enabled_) {
         phase_skip_ = phase_env_count("STRATA_CPU_PHASE_PROFILE_SKIP", 40, true);
         phase_limit_ = phase_env_count("STRATA_CPU_PHASE_PROFILE_JOBS", 400, false);
         phase_workers_ = std::make_unique<PhaseWorker[]>(n_threads);
-        log("CPU phase diagnostics: event-layer jobs only, skip %llu then sample %llu; timings include instrumentation",
-            (unsigned long long)phase_skip_, (unsigned long long)phase_limit_);
+        if (phase_trace_path && *phase_trace_path) {
+            phase_trace_fp_ = std::fopen(phase_trace_path, "w");
+            SQ_CHECK(phase_trace_fp_, "cannot open STRATA_CPU_PHASE_TRACE %s", phase_trace_path);
+            std::fprintf(phase_trace_fp_, "dispatch_mono_ns,kind,layer,n_tok,n_miss,pairs,"
+                                          "dispatch_to_first_start_ns,start_spread_ns,dispatch_to_last_end_ns,"
+                                          "join_wall_ns,workers_cpu_ns,max_worker_elapsed_ns\n");
+            std::fflush(phase_trace_fp_);
+        }
+        log("CPU phase diagnostics: event-layer jobs only, skip %llu then sample %llu; timings include instrumentation%s",
+            (unsigned long long)phase_skip_, (unsigned long long)phase_limit_,
+            phase_trace_fp_ ? "; per-job CSV enabled" : "");
     }
     layers_ = layers;
     mb_ = mb;
@@ -274,6 +297,7 @@ void CpuMoe::start(int n_threads, int n_layer, const std::vector<ExpertLayerDesc
 }
 
 void CpuMoe::stop() {
+    if (phase_trace_fp_) { std::fclose(phase_trace_fp_); phase_trace_fp_ = nullptr; }
     if (threads_.empty()) { iq3_down_cache_.reset(); phase_workers_.reset(); return; }
     quit_ = true;
     job_gen_.fetch_add(1);
@@ -373,6 +397,22 @@ bool CpuMoe::run_layer_impl(int tid, int layer, const float (*x)[2048], const in
                             int n_tok, float (*out)[2048]) {
     CpuMoePhaseCounts* phase = nullptr;
     if constexpr (Profile) phase = &phase_workers_[tid].counts;
+    struct JobSpan {
+        PhaseWorker* w = nullptr;
+        uint64_t dispatch = 0, cpu0 = 0;
+        JobSpan(PhaseWorker* worker, uint64_t dispatch_ns) : w(worker), dispatch(dispatch_ns) {
+            if constexpr (Profile) {
+                w->start_offset_ns = phase_now_ns() - dispatch;
+                cpu0 = thread_cpu_now_ns();
+            }
+        }
+        ~JobSpan() {
+            if constexpr (Profile) {
+                w->end_offset_ns = phase_now_ns() - dispatch;
+                w->cpu_ns = thread_cpu_now_ns() - cpu0;
+            }
+        }
+    } job_span(Profile ? &phase_workers_[tid] : nullptr, phase_dispatch_ns_);
     PhaseSpan<Profile> worker_time(Profile ? &phase->ns[CpuWorkerTotal] : nullptr);
     // h_ is shared by all layers.  It stays valid while this thread holds an unfinished chunk: the layer cannot
     // complete without it, and the next layer (which overwrites h_) only starts once the GPU has read this layer's
@@ -573,10 +613,16 @@ void CpuMoe::phase_begin_layer(int layer) {
     SQ_CHECK(!phase_active_, "CPU phase sample must be drained before the next layer");
     const uint64_t index = phase_profile_.seen_jobs++;
     if (index < phase_skip_ || phase_profile_.sampled_jobs >= phase_limit_) return;
-    for (int tid = 0; tid < n_threads_; ++tid) phase_workers_[tid].counts = {};
+    for (int tid = 0; tid < n_threads_; ++tid) {
+        phase_workers_[tid].counts = {};
+        phase_workers_[tid].start_offset_ns = 0;
+        phase_workers_[tid].end_offset_ns = 0;
+        phase_workers_[tid].cpu_ns = 0;
+    }
     phase_layer_ = layer;
     phase_active_ = true;
     phase_start_ns_ = phase_now_ns();
+    phase_dispatch_ns_ = phase_start_ns_;
 }
 
 void CpuMoe::phase_end_layer() {
@@ -588,9 +634,11 @@ void CpuMoe::phase_end_layer() {
     auto& groups = phase_profile_.groups;
     size_t index = 0;
     for (; index < groups.size(); ++index)
-        if (groups[index].n_tok == m.n_tok && groups[index].t_gu == layer.t_gu && groups[index].t_down == layer.t_down) break;
+        if (groups[index].kind == job_kind_ && groups[index].n_tok == m.n_tok &&
+            groups[index].t_gu == layer.t_gu && groups[index].t_down == layer.t_down) break;
     if (index == groups.size()) {
         CpuMoePhaseGroup group;
+        group.kind = job_kind_;
         group.n_tok = m.n_tok; group.t_gu = layer.t_gu; group.t_down = layer.t_down;
         groups.push_back(group);
     }
@@ -598,13 +646,16 @@ void CpuMoe::phase_end_layer() {
     ++group.jobs;
     group.dispatch_to_join_ns += wall;
     group.missing_experts += m.n_miss;
+    uint64_t job_pairs = 0;
     for (int j = 0; j < m.n_miss; ++j) {
         int nt = 0;
         for (int t = 0; t < m.n_tok; ++t) nt += m.w[j][t] != 0.f;
         ++group.expert_nt[nt];
         group.routed_pairs += nt;
+        job_pairs += nt;
     }
     uint64_t max_worker = 0;
+    uint64_t first_start = UINT64_MAX, last_start = 0, last_end = 0, cpu_sum = 0;
     for (int tid = 0; tid < n_threads_; ++tid) {
         const auto& source = phase_workers_[tid].counts;
         for (int p = 0; p < CpuPhaseCount; ++p) group.workers.ns[p] += source.ns[p];
@@ -613,8 +664,28 @@ void CpuMoe::phase_end_layer() {
         group.workers.gu_row_pairs += source.gu_row_pairs;
         group.workers.down_row_pairs += source.down_row_pairs;
         max_worker = std::max(max_worker, source.ns[CpuWorkerTotal]);
+        const PhaseWorker& worker = phase_workers_[tid];
+        if (worker.start_offset_ns == 0) continue;   // worker never entered run_layer for this job
+        first_start = std::min(first_start, worker.start_offset_ns);
+        last_start = std::max(last_start, worker.start_offset_ns);
+        last_end = std::max(last_end, worker.end_offset_ns);
+        cpu_sum += worker.cpu_ns;
     }
+    if (first_start == UINT64_MAX) first_start = 0;
     group.max_worker_ns += max_worker;
+    group.dispatch_to_first_start_ns += first_start;
+    group.start_spread_ns += last_start - first_start;
+    group.dispatch_to_last_end_ns += last_end;
+    group.worker_cpu_ns += cpu_sum;
+    if (phase_trace_fp_) {
+        std::fprintf(phase_trace_fp_,
+                     "%llu,%d,%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                     (unsigned long long)phase_dispatch_ns_, job_kind_, phase_layer_, m.n_tok,
+                     m.n_miss, (unsigned long long)job_pairs, (unsigned long long)first_start,
+                     (unsigned long long)(last_start - first_start), (unsigned long long)last_end,
+                     (unsigned long long)wall, (unsigned long long)cpu_sum, (unsigned long long)max_worker);
+        std::fflush(phase_trace_fp_);
+    }
     phase_active_ = false;
     ++phase_profile_.sampled_jobs;
     if (phase_profile_.sampled_jobs == phase_limit_) {
@@ -630,16 +701,21 @@ void CpuMoe::phase_log(bool partial) {
         (unsigned long long)phase_skip_, partial ? 1 : 0, n_threads_);
     for (const auto& group : phase_profile_.groups) {
         const auto& ns = group.workers.ns;
-        log("CPU_PHASE T=%d GU=%u DOWN=%u jobs=%llu missing=%llu pairs=%llu expertNT0..4=%llu,%llu,%llu,%llu,%llu "
-            "wall_ms=%.6f max_worker_ms=%.6f worker_ms=%.6f pack_gu_ms=%.6f gu_ms=%.6f gu_barrier_ms=%.6f "
+        const double jobs = (double)std::max<uint64_t>(group.jobs, 1);
+        log("CPU_PHASE kind=%d T=%d GU=%u DOWN=%u jobs=%llu missing=%llu pairs=%llu expertNT0..4=%llu,%llu,%llu,%llu,%llu "
+            "wall_ms=%.6f max_worker_ms=%.6f worker_ms=%.6f start_us=%.3f spread_us=%.3f last_end_us=%.3f "
+            "worker_cpu_ms=%.3f cpu_per_wall=%.2f pack_gu_ms=%.6f gu_ms=%.6f gu_barrier_ms=%.6f "
             "pack_down_ms=%.6f down_ms=%.6f reduce_ms=%.6f down_fused_ms=%.6f "
             "gu_quant_tokens=%llu down_quant_pairs=%llu gu_row_pairs=%llu down_row_pairs=%llu",
-            group.n_tok, group.t_gu, group.t_down, (unsigned long long)group.jobs,
+            group.kind, group.n_tok, group.t_gu, group.t_down, (unsigned long long)group.jobs,
             (unsigned long long)group.missing_experts, (unsigned long long)group.routed_pairs,
             (unsigned long long)group.expert_nt[0], (unsigned long long)group.expert_nt[1],
             (unsigned long long)group.expert_nt[2], (unsigned long long)group.expert_nt[3],
             (unsigned long long)group.expert_nt[4],
             group.dispatch_to_join_ns * 1e-6, group.max_worker_ns * 1e-6, ns[CpuWorkerTotal] * 1e-6,
+            group.dispatch_to_first_start_ns / jobs / 1000.0, group.start_spread_ns / jobs / 1000.0,
+            group.dispatch_to_last_end_ns / jobs / 1000.0, group.worker_cpu_ns / jobs / 1e6,
+            group.dispatch_to_join_ns ? (double)group.worker_cpu_ns / group.dispatch_to_join_ns : 0.0,
             ns[CpuPackGU] * 1e-6, ns[CpuGU] * 1e-6, ns[CpuGUBarrier] * 1e-6,
             ns[CpuPackDown] * 1e-6, ns[CpuDown] * 1e-6, ns[CpuReduce] * 1e-6, ns[CpuDownFused] * 1e-6,
             (unsigned long long)group.workers.gu_quant_tokens, (unsigned long long)group.workers.down_quant_pairs,

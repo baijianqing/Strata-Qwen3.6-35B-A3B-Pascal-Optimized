@@ -2018,6 +2018,7 @@ void Engine::run_step(bool mtp, int T) {
     const double step_start = now_ms();
     step_host_cpu_wait_ms_ = 0;
     step_misses_ = 0;
+    if (cpu_) cpu_->set_job_kind(mtp ? 1 : 0);
     SQ_CHECK(!sync_moe_ || (!mtp && T == 1), "STRATA_SYNC_MOE=1 requires single-token decode with MTP disabled");
     StepParams& P = mtp ? *mparams_host_ : *params_host_;
     ensure_kv_capacity(P.pos + T); // final guard covers trunk verification and every pending/recursive MTP write
