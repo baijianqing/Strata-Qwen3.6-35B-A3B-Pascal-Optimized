@@ -10,7 +10,8 @@
 //   <- INFO key=value ...             facts for the Monitor tab (context, kv, expert_slots, ...), before READY
 //   <- READY <context> stop            ready; "stop": a STOP line ends the running request
 //   -> GEN <max_new> [key=value ...] <id,id,...>
-//        keys: temperature top_p top_k min_p penalty_last_n penalty_repeat penalty_freq penalty_present seed;
+//        keys: temperature top_p top_k min_p penalty_last_n penalty_repeat penalty_freq penalty_present seed
+//              draft (0..--mtp-draft, changes the speculative window for this request);
 //        unknown keys are skipped (the ids start at the first token without '=')
 //   <- PP <position reached> <prompt tokens> <ms> <fresh tokens/s>   once per prompt slice
 //   <- T <id>                          each generated token (an end-of-turn token is sent, then the request ends)
@@ -128,7 +129,7 @@ struct ServeOptions {
 };
 
 /// The sampling keys of a GEN line, Strata's spelling.  `p` points after max_new; on return it points at the ids.
-void parse_keys(const char*& p, SamplingParams& sp) {
+void parse_keys(const char*& p, SamplingParams& sp, int* draft = nullptr) {
     for (;;) {
         while (*p == ' ') ++p;
         const char* start = p;
@@ -148,6 +149,7 @@ void parse_keys(const char*& p, SamplingParams& sp) {
         else if (k == "penalty_freq") sp.frequency_penalty = std::strtof(v, nullptr);
         else if (k == "penalty_present") sp.presence_penalty = std::strtof(v, nullptr);
         else if (k == "seed") sp.seed = std::strtoull(v, nullptr, 10);
+        else if (k == "draft" && draft) *draft = std::atoi(v);
         // pcie_frac, spec_min_p, cvec: settings of Strata's own engine that this one does not have
     }
 }
@@ -219,7 +221,9 @@ int serve(Engine& eng, const ServeOptions& so) {
         sp.top_k = 20;       // the sampled path's default, as in Strata's engine (requests normally set it)
         sp.top_p = 1.0f;
         p = endp;
-        parse_keys(p, sp);
+        int req_draft = -1;
+        parse_keys(p, sp, &req_draft);
+        if (req_draft >= 0) eng.set_mtp_draft(req_draft);
         if (sp.top_k < 1 || sp.top_k > kCand) sp.top_k = kCand;
         std::vector<int> ids;
         bool bad = max_new < 1;
