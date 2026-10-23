@@ -9,10 +9,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <string>
 #include <thread>
 
 namespace sq {
@@ -279,12 +281,17 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
     }
     // A sliding MTP window never reads more than mtp_window_ keys, so the MTP layer's KV can be a fixed ring.
     // Round up to 64 (the decode key-step) and keep at least 128 so a 64-key step crosses the seam at most once.
+    // STRATA_MTP_KV_RING selects the experiment: 1 = ring allocation (default), 0 = full KV with absolute
+    // indexing (the V21 path), 2 = full allocation but ring indexing (isolates index overhead at equal memory).
     if (mtp_on_ && mtp_window_ > 0) {
-        const int rounded = (std::max(mtp_window_, 128) + 63) / 64 * 64;
-        mtp_kv_capacity_ = std::min(rounded, opt_.ctx);
-        log("MTP KV ring: %d slots for window %d (%.1f MiB instead of the full-context MTP layer)",
-            mtp_kv_capacity_, mtp_window_,
-            (double)2 * c.n_head_kv * mtp_kv_capacity_ * (kv_int8_ ? c.head_dim + 4 : c.head_dim * 2) / 1048576.0);
+        const int rounded = std::min((std::max(mtp_window_, 128) + 63) / 64 * 64, opt_.ctx);
+        const int mode = (int)env_mib("STRATA_MTP_KV_RING", 1, 2);
+        mtp_kv_ring_ = mode == 0 ? 0 : rounded;
+        mtp_kv_capacity_ = mode == 1 ? rounded : 0;
+        const char* label = mode == 0 ? "full KV/absolute" : mode == 1 ? "ring/compact" : "ring index/full allocation";
+        log("MTP KV %s: ring %d slots, allocation %s (%d-token stride), window %d",
+            label, mtp_kv_ring_, mtp_kv_capacity_ > 0 ? "ring" : "full",
+            mtp_kv_capacity_ > 0 ? mtp_kv_capacity_ : kv_capacity_, mtp_window_);
     }
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     if (profile_pipeline_) {
@@ -406,6 +413,7 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
         opt_.cpu_threads, fr / 1073741824.0);
     draft_ = mtp_on_ ? opt_.mtp_draft : 0;
     if (mtp_on_) log("MTP speculative decoding: %d draft token(s) per step", opt_.mtp_draft);
+    mem_trace("ready");
     return true;
 }
 
@@ -450,6 +458,7 @@ void Engine::alloc_state() {
     CUDA_CHECK(cudaHostAlloc((void**)&mparams_host_, sizeof(StepParams), cudaHostAllocDefault));
     std::memset(params_host_, 0, sizeof(StepParams));
     std::memset(mparams_host_, 0, sizeof(StepParams));
+    mparams_host_->kv_ring = mtp_kv_ring_;   // MTP steps are the only ones that use ring addressing
     params_dev_ = dmalloc<StepParams>(1);
     mparams_dev_ = dmalloc<StepParams>(1);
     if (mtp_last_row_) {
@@ -519,9 +528,9 @@ void Engine::alloc_state() {
         log("checkpoint storage: %zu slot(s) in %s memory (%.0f MiB %s)", ckpts_.size(),
             ckpt_host_ ? "pinned host" : "device", ckpts_.size() * state_floats_ * 4 / 1048576.0,
             ckpt_host_ ? "VRAM saved" : "VRAM used");
-    if (mtp_on_ && mtp_kv_capacity_ > 0 && !ckpts_.empty()) {
-        const size_t k_bytes = (size_t)c.n_head_kv * mtp_kv_capacity_ * (kv_int8_ ? c.head_dim : c.head_dim * 2);
-        const size_t s_bytes = kv_int8_ ? (size_t)c.n_head_kv * mtp_kv_capacity_ * sizeof(float) : 0;
+    if (mtp_on_ && mtp_kv_ring_ > 0 && !ckpts_.empty()) {
+        const size_t k_bytes = (size_t)c.n_head_kv * mtp_kv_ring_ * (kv_int8_ ? c.head_dim : c.head_dim * 2);
+        const size_t s_bytes = kv_int8_ ? (size_t)c.n_head_kv * mtp_kv_ring_ * sizeof(float) : 0;
         mtp_kv_bytes_ = 2 * k_bytes + 2 * s_bytes;
         for (auto& ck : ckpts_)
             CUDA_CHECK(cudaHostAlloc(&ck.mtp_kv, mtp_kv_bytes_, cudaHostAllocDefault));
@@ -642,6 +651,27 @@ void Engine::ensure_kv_capacity(int tokens) {
     log("KV capacity grew %d -> %d / %d tokens: +%.1f MiB, expert cache %.1f -> %.1f MiB, %.1f ms",
         previous, capacity, opt_.ctx, extra / 1048576.0, cache_before / 1048576.0, cache_bytes_ / 1048576.0,
         now_ms() - started);
+}
+
+void Engine::mem_trace(const char* point) const {
+    if (env_mib("STRATA_MEM_TRACE", 1, 1) == 0) return;
+    long peak_kb = 0, rss_kb = 0, anon_kb = 0, file_kb = 0, shmem_kb = 0;
+#ifdef __linux__
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmHWM:", 0) == 0) std::sscanf(line.c_str() + 6, "%ld", &peak_kb);
+        else if (line.rfind("VmRSS:", 0) == 0) std::sscanf(line.c_str() + 6, "%ld", &rss_kb);
+        else if (line.rfind("RssAnon:", 0) == 0) std::sscanf(line.c_str() + 8, "%ld", &anon_kb);
+        else if (line.rfind("RssFile:", 0) == 0) std::sscanf(line.c_str() + 8, "%ld", &file_kb);
+        else if (line.rfind("RssShmem:", 0) == 0) std::sscanf(line.c_str() + 9, "%ld", &shmem_kb);
+    }
+#endif
+    log("MEM_TRACE %s n_past=%d kv=%.1fMiB kv_capacity=%d mtp_ring=%d cache_slots=%lld cache=%.1fMiB "
+        "peak_rss=%.1fMiB rss=%.1fMiB anon=%.1fMiB file=%.1fMiB shmem=%.1fMiB", point, n_past_,
+        kv_bytes() / 1048576.0, kv_capacity_, mtp_kv_ring_, (long long)cache_slots_total_,
+        cache_bytes_ / 1048576.0, peak_kb / 1024.0, rss_kb / 1024.0, anon_kb / 1024.0, file_kb / 1024.0,
+        shmem_kb / 1024.0);
 }
 
 // ================================================================================================= expert cache
@@ -1472,6 +1502,7 @@ void Engine::build_layer(cudaStream_t s, int il, int T, const StepParams* P, con
             mtp_tail_host_->seq = mparams_host_->seq;
             mtp_tail_host_->n_tok = 1;
             mtp_tail_host_->kv_window = mparams_host_->kv_window;
+            mtp_tail_host_->kv_ring = mparams_host_->kv_ring;
             mtp_tail_host_->token[0] = mparams_host_->token[last];
             CUDA_CHECK(cudaMemcpyAsync(mtp_tail_dev_, mtp_tail_host_, step_params_bytes(0), cudaMemcpyHostToDevice, s));
             P = mtp_tail_dev_;
@@ -2028,6 +2059,7 @@ int Engine::mtp_catch_up(int next, bool need_draft, bool defer_completion) {
     StepParams& P = *mparams_host_;
     P.pos = q;
     P.kv_window = mtp_window_;
+    P.kv_ring = mtp_kv_ring_;
     for (int j = 0; j < k; ++j) {
         // pair j: hidden state of position q + j, token of position q + j + 1
         const int t = q + j + 1 < n_past_ ? history_[q + j + 1] : next;
@@ -2066,6 +2098,7 @@ int Engine::mtp_recur(int prev_draft, int pos) {
     StepParams& P = *mparams_host_;
     P.pos = pos;
     P.kv_window = mtp_window_;
+    P.kv_ring = mtp_kv_ring_;
     P.token[0] = prev_draft;
     model_.embed(prev_draft, P.emb[0]);
     run_step(true, 1);
@@ -2565,23 +2598,24 @@ int Engine::reuse_prefix(const std::vector<int>& prompt) {
     CUDA_CHECK(cudaMemcpyAsync(mtp_hin_, pick->hin, (size_t)kMaxT * c.n_embd * 4, from_ckpt, stream_));
     if (mtp_kv_bytes_ > 0) {
         // The MTP ring may have wrapped since this checkpoint; restore its exact last-window contents.
-        const size_t k_bytes = (size_t)c.n_head_kv * mtp_kv_capacity_ * (kv_int8_ ? c.head_dim : c.head_dim * 2);
-        const size_t s_bytes = kv_int8_ ? (size_t)c.n_head_kv * mtp_kv_capacity_ * sizeof(float) : 0;
+        const int mtp_layer = c.n_layer;
+        const int stride = kv_stride_for(mtp_layer);
         const uint8_t* src = (const uint8_t*)pick->mtp_kv;
         size_t off = 0;
-        auto restore = [&](void* dev, size_t bytes) {
-            CUDA_CHECK(cudaMemcpyAsync(dev, src + off, bytes, cudaMemcpyHostToDevice, stream_));
-            off += bytes;
+        auto restore = [&](void* dev, size_t token_bytes) {
+            CUDA_CHECK(cudaMemcpy2DAsync(dev, (size_t)stride * token_bytes, src + off,
+                                         (size_t)mtp_kv_ring_ * token_bytes, (size_t)mtp_kv_ring_ * token_bytes,
+                                         c.n_head_kv, cudaMemcpyHostToDevice, stream_));
+            off += (size_t)c.n_head_kv * mtp_kv_ring_ * token_bytes;
         };
-        const int mtp_layer = c.n_layer;
         if (kv_int8_) {
-            restore(kc_i8_[mtp_layer], k_bytes);
-            restore(vc_i8_[mtp_layer], k_bytes);
-            restore(kc_scale_[mtp_layer], s_bytes);
-            restore(vc_scale_[mtp_layer], s_bytes);
+            restore(kc_i8_[mtp_layer], c.head_dim);
+            restore(vc_i8_[mtp_layer], c.head_dim);
+            restore(kc_scale_[mtp_layer], sizeof(float));
+            restore(vc_scale_[mtp_layer], sizeof(float));
         } else {
-            restore(kc_[mtp_layer], k_bytes);
-            restore(vc_[mtp_layer], k_bytes);
+            restore(kc_[mtp_layer], c.head_dim * 2);
+            restore(vc_[mtp_layer], c.head_dim * 2);
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -2590,6 +2624,7 @@ int Engine::reuse_prefix(const std::vector<int>& prompt) {
     n_past_ = (int)history_.size();
     logits_valid_ = false;
     mtp_k_ = pick->mtp_k;
+    mem_trace("checkpoint-restore");
     return report(n_past_);
 }
 
@@ -2603,6 +2638,7 @@ void Engine::save_checkpoint(bool base) {
             ck.stamp = ++ckpt_clock_;
             if (phase_switch_profile_) log("CHECKPOINT_PROFILE tokens=%d base=%d copy=0 ms=%.2f",
                                            n_past_, base ? 1 : 0, now_ms() - t0);
+            mem_trace("checkpoint-save(no-copy)");
             return;
         }
     Checkpoint* slot = &ckpts_[first];
@@ -2614,23 +2650,24 @@ void Engine::save_checkpoint(bool base) {
     CUDA_CHECK(cudaMemcpyAsync(slot->arena, state_arena_, state_floats_ * 4, to_ckpt, stream_));
     CUDA_CHECK(cudaMemcpyAsync(slot->hin, mtp_hin_, (size_t)kMaxT * c.n_embd * 4, to_ckpt, stream_));
     if (mtp_kv_bytes_ > 0) {
-        const size_t k_bytes = (size_t)c.n_head_kv * mtp_kv_capacity_ * (kv_int8_ ? c.head_dim : c.head_dim * 2);
-        const size_t s_bytes = kv_int8_ ? (size_t)c.n_head_kv * mtp_kv_capacity_ * sizeof(float) : 0;
+        const int mtp_layer = c.n_layer;
+        const int stride = kv_stride_for(mtp_layer);
         uint8_t* dst = (uint8_t*)slot->mtp_kv;
         size_t off = 0;
-        auto save = [&](const void* dev, size_t bytes) {
-            CUDA_CHECK(cudaMemcpyAsync(dst + off, dev, bytes, cudaMemcpyDeviceToHost, stream_));
-            off += bytes;
+        auto save = [&](const void* dev, size_t token_bytes) {
+            CUDA_CHECK(cudaMemcpy2DAsync(dst + off, (size_t)mtp_kv_ring_ * token_bytes, dev,
+                                         (size_t)stride * token_bytes, (size_t)mtp_kv_ring_ * token_bytes,
+                                         c.n_head_kv, cudaMemcpyDeviceToHost, stream_));
+            off += (size_t)c.n_head_kv * mtp_kv_ring_ * token_bytes;
         };
-        const int mtp_layer = c.n_layer;
         if (kv_int8_) {
-            save(kc_i8_[mtp_layer], k_bytes);
-            save(vc_i8_[mtp_layer], k_bytes);
-            save(kc_scale_[mtp_layer], s_bytes);
-            save(vc_scale_[mtp_layer], s_bytes);
+            save(kc_i8_[mtp_layer], c.head_dim);
+            save(vc_i8_[mtp_layer], c.head_dim);
+            save(kc_scale_[mtp_layer], sizeof(float));
+            save(vc_scale_[mtp_layer], sizeof(float));
         } else {
-            save(kc_[mtp_layer], k_bytes);
-            save(vc_[mtp_layer], k_bytes);
+            save(kc_[mtp_layer], c.head_dim * 2);
+            save(vc_[mtp_layer], c.head_dim * 2);
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -2639,6 +2676,13 @@ void Engine::save_checkpoint(bool base) {
     slot->stamp = ++ckpt_clock_;
     if (phase_switch_profile_) log("CHECKPOINT_PROFILE tokens=%d base=%d copy=1 bytes=%.1fMiB ms=%.2f",
                                    n_past_, base ? 1 : 0, state_floats_ * 4 / 1048576.0, now_ms() - t0);
+    mem_trace("checkpoint-save");
+}
+
+unsigned long long Engine::cpu_wait_ns() const {
+    unsigned long long wait = 0;
+    CUDA_CHECK(cudaMemcpy(&wait, wait_ns_, 8, cudaMemcpyDeviceToHost));
+    return wait;
 }
 
 std::string Engine::status_line() const {
@@ -2780,20 +2824,20 @@ std::vector<uint8_t> Engine::debug_prefix_state() {
         CUDA_CHECK(cudaMemcpy2D(result.data() + offset, width, source, (size_t)stride * token_bytes,
                                 width, c.n_head_kv, cudaMemcpyDeviceToHost));
     };
-    // A wrapped MTP ring stores only the last `cap` positions; emit them in logical order.
-    auto append_ring_heads = [&](const void* source, int positions, size_t token_bytes, int cap) {
+    // A wrapped MTP ring stores only the last `ring` positions; emit them in logical order.
+    auto append_ring_heads = [&](const void* source, int positions, size_t token_bytes, int ring, int stride) {
         if (!source || positions <= 0) return;
-        const int count = std::min(positions, cap);
+        const int count = std::min(positions, ring);
         const int start = positions - count;
         const size_t width = (size_t)count * token_bytes;
         const size_t offset = result.size();
         result.resize(offset + width * c.n_head_kv);
-        const size_t ring_pitch = (size_t)cap * token_bytes;
-        const int s0 = start % cap;
-        const int first = std::min(count, cap - s0);
+        const size_t head_pitch = (size_t)stride * token_bytes;
+        const int s0 = start % ring;
+        const int first = std::min(count, ring - s0);
         auto copy = [&](size_t dst_off, const uint8_t* src, int n) {
             if (n <= 0) return;
-            CUDA_CHECK(cudaMemcpy2D(result.data() + offset + dst_off, width, src, ring_pitch,
+            CUDA_CHECK(cudaMemcpy2D(result.data() + offset + dst_off, width, src, head_pitch,
                                     (size_t)n * token_bytes, c.n_head_kv, cudaMemcpyDeviceToHost));
         };
         copy(0, (const uint8_t*)source + (size_t)s0 * token_bytes, first);
@@ -2802,9 +2846,9 @@ std::vector<uint8_t> Engine::debug_prefix_state() {
     for (int layer = 0; layer < c.n_moe_layers(); ++layer) {
         const int positions = layer < c.n_layer ? n_past_ : std::max(0, n_past_ - mtp_k_);
         const int stride = kv_stride_for(layer);
-        const int ring = stride != kv_capacity_ ? stride : 0;
+        const int ring = kv_ring_for(layer);
         auto append_layer = [&](const void* source, size_t token_bytes) {
-            if (ring > 0) append_ring_heads(source, positions, token_bytes, ring);
+            if (ring > 0) append_ring_heads(source, positions, token_bytes, ring, stride);
             else append_heads(source, positions, token_bytes, kv_capacity_);
         };
         if (kv_int8_) {

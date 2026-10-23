@@ -1054,8 +1054,8 @@ __global__ void __launch_bounds__(256) attn_prep_kernel(const float* __restrict_
     __shared__ float sv[kHD];
     const int b = blockIdx.x, t = threadIdx.x, tk = blockIdx.y;
     const int pos = P->pos + tk;
-    // The MTP layer indexes a fixed-size ring (max_ctx); target layers keep the absolute position.
-    const int slot = P->kv_window > 0 ? pos % max_ctx : pos;
+    // The MTP layer indexes a fixed-size ring; target layers keep the absolute position.
+    const int slot = P->kv_ring > 0 ? pos % P->kv_ring : pos;
     qkv += tk * kQKV;
     q_out += tk * kNH * kHD;
     if (b >= kNH + kNKV) {
@@ -1103,7 +1103,7 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(const float* __restric
     part_o += (size_t)tk * kNH * kAttSplits * kHD;
     part_ml += (size_t)tk * kNH * kAttSplits * 2;
     const int j1 = min(j0 + chunk, L);
-    const bool ring = P->kv_window > 0;   // MTP layer: max_ctx is the physical ring size
+    const int ring_slots = P->kv_ring;   // MTP layer: positions wrap inside this ring (0 = absolute)
     for (int i = t; i < 8 * kHD; i += 256) sq[i / kHD][i % kHD] = q[(kh * 8) * kHD + i];
     if (t < 8) { sm[t] = -INFINITY; sl[t] = 0.0f; }
     __syncthreads();
@@ -1112,11 +1112,12 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(const float* __restric
     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int s0 = j0; s0 < j1; s0 += kAttSub) {
         const int n = min(kAttSub, j1 - s0);
-        const int rs = ring ? s0 % max_ctx : s0;
+        const bool ring = ring_slots > 0;
+        const int rs = ring ? s0 % ring_slots : s0;
         float sc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         if (key < n) {
             int kidx = rs + key;
-            if (ring && kidx >= max_ctx) kidx -= max_ctx;
+            if (ring && kidx >= ring_slots) kidx -= ring_slots;
             const int4* kr = (const int4*)(kc + ((size_t)kh * max_ctx + kidx) * kHD + part * 64);
 #pragma unroll 2
             for (int c = 0; c < 8; ++c) {
@@ -1164,7 +1165,7 @@ __global__ void __launch_bounds__(256) attn_decode_kernel(const float* __restric
             }
         }
         __syncthreads();
-        const int n1 = ring ? min(n, max_ctx - rs) : n;   // first run before the ring seam
+        const int n1 = ring ? min(n, ring_slots - rs) : n;   // first run before the ring seam
         const __half* vb = vc + ((size_t)kh * max_ctx + rs) * kHD + t;
 #pragma unroll
         for (int h = 0; h < 8; ++h) acc[h] *= sscale[h];

@@ -103,6 +103,7 @@ void usage() {
         "  --bench [--bench-prompt N] [-n N]\n"
         "  --selfcheck N      logits of a random N-token prompt: batched prefill vs prefill(N-1) + decode(1)\n"
         "  --selfcheck-layer-major N  chunk/layer-major parity, continuation, prefix reuse and MTP rollback;\n"
+        "  --selfcheck-mtp-ring N     MTP KV ring draft/rollback/restore checks around window boundaries;\n"
         "                     N >= 16; forces deferred MMQ prefill, no adaptation, >=1 checkpoint; fails if KL > .01\n"
         "                     STRATA_LAYER_PARITY_REFERENCE_CHUNK overrides reference chunk size;\n"
         "                     STRATA_LAYER_PARITY_CONTROL=1 compares two chunk-major paths instead\n"
@@ -236,7 +237,9 @@ int serve(Engine& eng, const ServeOptions& so) {
         eng.expert_counts(hits0, miss0);
         const uint64_t acc0 = eng.stats.accepted, off0 = eng.stats.drafted;
         const uint64_t swaps0 = eng.stats.swaps;
-        const double adapt_ms0 = eng.stats.adapt_ms;
+        const uint64_t spec0 = eng.stats.spec_steps, skip0 = eng.stats.spec_skipped;
+        const double adapt_ms0 = eng.stats.adapt_ms, mtp_ms0 = eng.stats.mtp_ms, verify_ms0 = eng.stats.verify_ms;
+        const unsigned long long wait0 = eng.cpu_wait_ns();
 
         // ---- the prompt: what a checkpoint or the live state already holds, then the rest in slices
         const auto t0 = Clock::now();
@@ -283,6 +286,7 @@ int serve(Engine& eng, const ServeOptions& so) {
             emit("PP %d %d %.0f %.1f", pos, n, ms, ms > 0 ? 1000.0 * (pos - reused) / ms : 0.0);
         }
         if (reused < n) eng.save_checkpoint();
+        eng.mem_trace("prefill");
         uint64_t hits_after_prompt = 0, miss_after_prompt = 0;
         eng.expert_counts(hits_after_prompt, miss_after_prompt);
         const uint64_t swaps_after_prompt = eng.stats.swaps;
@@ -309,6 +313,19 @@ int serve(Engine& eng, const ServeOptions& so) {
         const auto t2 = Clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        {
+            const double draft_ms = eng.stats.mtp_ms - mtp_ms0;
+            const double verify_ms = eng.stats.verify_ms - verify_ms0;
+            const double adapt_ms = eng.stats.adapt_ms - adapt_ms0;
+            const unsigned long long wait_ms = (eng.cpu_wait_ns() - wait0) / 1000000ull;
+            log("DECODE_PROFILE wall_ms=%.1f draft_ms=%.1f verify_ms=%.1f other_ms=%.1f adapt_ms=%.1f "
+                "cpu_wait_ms=%llu specs=%llu skipped=%llu drafted=%llu accepted=%llu swaps=%llu tokens=%lld",
+                decode_ms, draft_ms, verify_ms, std::max(0.0, decode_ms - draft_ms - verify_ms - adapt_ms),
+                adapt_ms, wait_ms, (unsigned long long)(eng.stats.spec_steps - spec0),
+                (unsigned long long)(eng.stats.spec_skipped - skip0),
+                (unsigned long long)(eng.stats.drafted - off0), (unsigned long long)(eng.stats.accepted - acc0),
+                (unsigned long long)(eng.stats.swaps - swaps0), produced);
+        }
         uint64_t hits = 0, miss = 0;
         eng.expert_counts(hits, miss);
         hits -= hits0;
@@ -530,6 +547,177 @@ int selfcheck_layer_major(Engine& eng, int n) {
     return ok ? 0 : 1;
 }
 
+uint64_t digest_bytes(const void* data, size_t bytes) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint64_t h = 1469598103934665603ull;   // FNV-1a
+    for (size_t i = 0; i < bytes; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+uint64_t digest_floats(const std::vector<float>& v) {
+    return digest_bytes(v.data(), v.size() * sizeof(float));
+}
+
+uint64_t digest_tokens(const std::vector<int>& v) {
+    return digest_bytes(v.data(), v.size() * sizeof(int));
+}
+
+void logit_delta(const std::vector<float>& a, const std::vector<float>& b, double& kl, double& max_abs) {
+    kl = max_abs = 0.0;
+    if (a.size() != b.size() || a.empty()) { kl = 1e9; max_abs = 1e9; return; }
+    double ma = -1e30, mb = -1e30;
+    for (float v : a) ma = std::max(ma, (double)v);
+    for (float v : b) mb = std::max(mb, (double)v);
+    double sa = 0, sb = 0;
+    for (float v : a) sa += std::exp((double)v - ma);
+    for (float v : b) sb += std::exp((double)v - mb);
+    for (size_t i = 0; i < a.size(); ++i) {
+        const double la = a[i] - ma - std::log(sa), lb = b[i] - mb - std::log(sb);
+        kl += std::exp(la) * (la - lb);
+        if (la > -10) max_abs = std::max(max_abs, std::abs((double)a[i] - (double)b[i]));
+    }
+}
+
+std::vector<int> ring_token_ids(int n, uint64_t seed) {
+    std::vector<int> ids((size_t)n);
+    uint64_t x = seed ? seed : 1;
+    for (int i = 0; i < n; ++i) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        ids[(size_t)i] = 1000 + (int)(x % 48000u);
+    }
+    return ids;
+}
+
+// Targeted checks for the MTP KV ring: draft logits and speculative acceptance across window boundaries,
+// rollback with no/partial/full draft acceptance, and a checkpoint restored after more than one window.
+// Output is deterministic, so run it with STRATA_MTP_KV_RING=0/1/2 and diff the RING_CHECK lines.
+int selfcheck_mtp_ring(Engine& eng, int max_len) {
+    const int W = eng.mtp_window();
+    const int D = eng.mtp_draft();
+    SQ_CHECK(W > 0, "--selfcheck-mtp-ring requires --mtp-window > 0");
+    SQ_CHECK(D > 0, "--selfcheck-mtp-ring requires active MTP drafts");
+    SQ_CHECK(eng.ckpt_slots() > 0, "--selfcheck-mtp-ring requires --ckpt-slots > 0");
+    SQ_CHECK(max_len >= 16, "--selfcheck-mtp-ring requires N >= 16");
+    eng.debug_freeze_cache_adaptation();
+    const int G = 12;
+    std::printf("RING_SELFCHECK window=%d draft=%d ctx=%d ring=%d alloc=%d cache_slots=%lld\n",
+                W, D, eng.ctx(), eng.mtp_kv_ring(), eng.mtp_kv_capacity(), (long long)eng.cache_slots());
+    auto generate = [&](std::vector<int>& all, uint64_t& accepted, uint64_t& drafted) {
+        SamplingParams sp;   // greedy
+        eng.begin_request(sp);
+        std::mt19937_64 rng(999);
+        all.clear();
+        all.push_back(eng.sample(sp, rng));
+        const uint64_t a0 = eng.stats.accepted, d0 = eng.stats.drafted;
+        std::vector<int> step;
+        for (int i = 0; i < G; ++i) {
+            eng.spec_step(all.back(), sp, rng, step);
+            all.insert(all.end(), step.begin(), step.end());
+        }
+        accepted = eng.stats.accepted - a0;
+        drafted = eng.stats.drafted - d0;
+    };
+    const int lens[] = {W - 1, W, W + 1, 2 * W - 1, 2 * W, 2 * W + 1};
+    for (int L : lens) {
+        if (L > max_len || L + 2 * G + D + 8 > eng.ctx()) continue;
+        std::vector<int> ids = ring_token_ids(L + 2 * G + D + 8, 0x9e3779b97f4a7c15ull ^ (uint64_t)L);
+        // (1) draft distribution at the boundary: exercises the pair the prefill left pending.
+        eng.reset();
+        eng.feed(ids.data(), L);
+        SamplingParams sp;
+        std::mt19937_64 rng(7);
+        eng.begin_request(sp);
+        const int first = eng.sample(sp, rng);
+        const std::vector<float> draft = eng.debug_mtp_catch_up(first, true);
+        std::printf("RING_CHECK len=%d phase=draft digest=%016llx first=%d\n", L, (unsigned long long)digest_floats(draft), first);
+        // (2) speculative decoding across the boundary.
+        eng.reset();
+        eng.feed(ids.data(), L);
+        std::vector<int> all;
+        uint64_t accepted = 0, drafted = 0;
+        generate(all, accepted, drafted);
+        std::printf("RING_CHECK len=%d phase=spec digest=%016llx count=%zu acc=%llu drafted=%llu\n", L,
+                    (unsigned long long)digest_tokens(all), all.size(), (unsigned long long)accepted,
+                    (unsigned long long)drafted);
+        std::fflush(stdout);
+    }
+    // (3) rollback: no draft accepted (keep=1), partial, and all.
+    {
+        const int L = W + 1;
+        const int T = D + 1;
+        std::vector<int> ids = ring_token_ids(L + 2 * G + D + 8, 0x123456789abcdefull);
+        const int keeps[] = {1, 1 + T / 2, T};
+        for (int keep : keeps) {
+            eng.reset();
+            eng.feed(ids.data(), L);
+            const std::vector<float> verified = eng.debug_verify(ids.data() + L, T, keep);
+            SamplingParams sp;
+            std::mt19937_64 rng(11);
+            eng.begin_request(sp);
+            const std::vector<int> cont = ring_token_ids(1, 0xabcdef0123456789ull ^ (uint64_t)keep);
+            eng.feed(cont.data(), 1);
+            const std::vector<float> after = eng.logits_host();
+            std::printf("RING_CHECK len=%d phase=rollback keep=%d verified=%016llx after=%016llx\n", L, keep,
+                        (unsigned long long)digest_floats(verified), (unsigned long long)digest_floats(after));
+        }
+        std::fflush(stdout);
+    }
+    // (4) checkpoint saved below the boundary, the ring wrapped by running past one window, then restored.
+    // Both sides use the same two-feed split (prefix, suffix): the reference recomputes the prefix instead of
+    // restoring it, so only the checkpoint/ring restore differs.
+    {
+        const int P = W - 1, Q = W + 8;
+        std::vector<int> ids = ring_token_ids(P + Q, 0xdeadbeefcafef00dull);
+        std::vector<int> suffix(ids.begin() + P, ids.end());
+        suffix[3] ^= 0x55;   // make the rewound suffix differ from the live one
+        std::vector<int> prompt(ids.begin(), ids.begin() + P);
+        prompt.insert(prompt.end(), suffix.begin(), suffix.end());
+        eng.reset();
+        eng.feed(ids.data(), P);
+        eng.save_checkpoint(true);
+        eng.feed(ids.data() + P, Q);   // live history is now P + the original suffix
+        const int reused = eng.reuse_prefix(prompt);
+        eng.feed(prompt.data() + reused, (int)prompt.size() - reused);
+        const std::vector<float> restored_prefill = eng.logits_host();
+        std::vector<int> all;
+        uint64_t accepted = 0, drafted = 0;
+        generate(all, accepted, drafted);
+        const uint64_t got = digest_tokens(all);
+        // reference: recompute the same prefix, then feed the same suffix
+        eng.reset();
+        eng.feed(prompt.data(), P);
+        eng.feed(prompt.data() + P, Q);
+        const std::vector<float> fresh_prefill = eng.logits_host();
+        std::vector<int> ref;
+        uint64_t ref_accepted = 0, ref_drafted = 0;
+        generate(ref, ref_accepted, ref_drafted);
+        const uint64_t want = digest_tokens(ref);
+        double prefill_kl = 0, prefill_max = 0;
+        logit_delta(restored_prefill, fresh_prefill, prefill_kl, prefill_max);
+        const bool ok = reused == P && got == want && accepted == ref_accepted && drafted == ref_drafted &&
+                        prefill_kl <= 0.01;
+        std::printf("RING_CHECK phase=restore checkpoint=%d reused=%d prefill=%016llx/%016llx kl=%.3e "
+                    "max=%.3e restored=%016llx fresh=%016llx acc=%llu/%llu drafted=%llu/%llu\n", P, reused,
+                    (unsigned long long)digest_floats(restored_prefill),
+                    (unsigned long long)digest_floats(fresh_prefill), prefill_kl, prefill_max,
+                    (unsigned long long)got, (unsigned long long)want, (unsigned long long)accepted,
+                    (unsigned long long)ref_accepted, (unsigned long long)drafted,
+                    (unsigned long long)ref_drafted);
+        std::printf("RING_TOKENS restored:");
+        for (int t : all) std::printf(" %d", t);
+        std::printf("\nRING_TOKENS fresh:");
+        for (int t : ref) std::printf(" %d", t);
+        std::printf("\n");
+        std::printf("MTP RING RESTORE %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 2;
+    }
+}
+
 }  // namespace
 
 // Compares the long and short prompt paths on the same prefix: last-token logits for several prefix lengths,
@@ -611,8 +799,9 @@ int main(int argc, char** argv) {
     opt.profile_path = "data/expert-profile-qwen36.bin";
     ServeOptions so;
     std::string ids_s, dump_logits;
-    int n_gen = 32, bench_prompt = 512, selfcheck = 0, layer_major_check = 0;
+    int n_gen = 32, bench_prompt = 512, selfcheck = 0, layer_major_check = 0, mtp_ring_check = 0;
     bool do_serve = false, do_bench = false, spec_check = false, layer_major_requested = false;
+    bool mtp_ring_requested = false;
     bool short_parity = false;
     SamplingParams sp;
     for (int i = 1; i < argc; ++i) {
@@ -662,6 +851,10 @@ int main(int argc, char** argv) {
             layer_major_check = std::stoi(next());
             layer_major_requested = true;
         }
+        else if (a == "--selfcheck-mtp-ring") {
+            mtp_ring_check = std::stoi(next());
+            mtp_ring_requested = true;
+        }
         else if (a == "--temp") sp.temperature = std::stof(next());
         else if (a == "--top-k") sp.top_k = std::stoi(next());
         else if (a == "--top-p") sp.top_p = std::stof(next());
@@ -690,12 +883,24 @@ int main(int argc, char** argv) {
         opt.use_graph = false;
         opt.ckpt_slots = std::max(opt.ckpt_slots, 1);
     }
+    if (mtp_ring_requested) {
+        SQ_CHECK(mtp_ring_check >= 16, "--selfcheck-mtp-ring requires N >= 16");
+        SQ_CHECK(!do_serve && !do_bench && !spec_check && selfcheck == 0 && !layer_major_requested && ids_s.empty(),
+                 "--selfcheck-mtp-ring is a standalone check");
+        SQ_CHECK(opt.mtp_draft > 0 && opt.mtp_window > 0,
+                 "--selfcheck-mtp-ring requires --mtp-draft > 0 and --mtp-window > 0");
+        SQ_CHECK(opt.ckpt_slots > 0, "--selfcheck-mtp-ring requires --ckpt-slots > 0");
+        opt.adapt_every = 0;
+        opt.use_graph = false;
+        opt.ckpt_slots = std::max(opt.ckpt_slots, 1);
+    }
     if (!so.profile_save.empty() && std::ifstream(so.profile_save).good()) opt.profile_path = so.profile_save;
     Engine eng;
     std::string err;
     if (!eng.init(opt, err)) die("%s", err.c_str());
     if (short_parity) return short_parity_check(eng, ids_s, n_gen);
     if (layer_major_requested) return selfcheck_layer_major(eng, layer_major_check);
+    if (mtp_ring_requested) return selfcheck_mtp_ring(eng, mtp_ring_check);
     if (do_serve) return serve(eng, so);
     if (selfcheck > 1) {
         std::mt19937 rng(7);
@@ -804,6 +1009,7 @@ int main(int argc, char** argv) {
     if (ids.empty()) { usage(); return 1; }
     const double t0 = now_ms();
     eng.feed(ids.data(), (int)ids.size());
+    eng.mem_trace("prefill");
     const double t1 = now_ms();
     if (!dump_logits.empty()) {
         auto lg = eng.logits_host();

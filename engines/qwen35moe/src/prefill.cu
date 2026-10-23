@@ -775,7 +775,7 @@ constexpr size_t attn_smem() {
 template <int AQ, bool SHARE_KV = false>
 __global__ void __launch_bounds__(256) attn_prefill_kernel(const __half* __restrict__ Qh, const __half* __restrict__ kc,
                                                            const __half* __restrict__ vc, int T, int p0, int max_ctx,
-                                                           int kv_window, int kv_floor,
+                                                           int kv_window, int kv_floor, int kv_ring,
                                                            const float* __restrict__ qkv, int ld,
                                                            __half* __restrict__ out) {
     constexpr int kAQ = AQ, kAR = AQ * 8;
@@ -817,7 +817,7 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(const __half* __restr
         __syncthreads();
         // Ring offset for the MTP layer. The tile is kAK keys and both k0 and the ring are 32/64-aligned,
         // so the whole 32-key tile maps contiguously.
-        const int k0s = kv_window > 0 ? (k0 % max_ctx) : k0;
+        const int k0s = kv_ring > 0 ? (k0 % kv_ring) : k0;
         for (int i = tid; i < kAK * kHD / 8; i += AQ * 32) {
             const int j = i / (kHD / 8), c8 = i % (kHD / 8);
             int4 kv4 = make_int4(0, 0, 0, 0), vv4 = make_int4(0, 0, 0, 0);
@@ -943,26 +943,27 @@ __global__ void __launch_bounds__(256) attn_prefill_kernel(const __half* __restr
 
 template <int AQ, bool SHARE_KV = false>
 void launch_attn_variant(const __half* q, const __half* k, const __half* v, int T, int p0, int max_ctx,
-                         int kv_window, int kv_floor, const float* qkv, int ld, __half* out, cudaStream_t stream) {
+                         int kv_window, int kv_floor, int kv_ring, const float* qkv, int ld, __half* out,
+                         cudaStream_t stream) {
     attn_prefill_kernel<AQ, SHARE_KV><<<dim3((T + AQ - 1) / AQ, kNKV), AQ * 32,
                                       attn_smem<AQ, SHARE_KV>(), stream>>>(q, k, v, T, p0, max_ctx, kv_window,
-                                                                           kv_floor, qkv, ld, out);
+                                                                           kv_floor, kv_ring, qkv, ld, out);
 }
 
 // Both the prepared main-layer path and ordinary/MTP path use this dispatcher.
 void launch_attn_prefill(bool shared_kv, int aq, const __half* q, const __half* k, const __half* v,
-                        int T, int p0, int max_ctx, int kv_window, int kv_floor, const float* qkv, int ld,
-                        __half* out, cudaStream_t stream) {
+                        int T, int p0, int max_ctx, int kv_window, int kv_floor, int kv_ring, const float* qkv,
+                        int ld, __half* out, cudaStream_t stream) {
     if (!shared_kv) {
-        if (aq == 2) launch_attn_variant<2>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, qkv, ld, out, stream);
-        else launch_attn_variant<8>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, qkv, ld, out, stream);
+        if (aq == 2) launch_attn_variant<2>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, kv_ring, qkv, ld, out, stream);
+        else launch_attn_variant<8>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, kv_ring, qkv, ld, out, stream);
         return;
     }
     switch (aq) {
-        case 2: launch_attn_variant<2, true>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, qkv, ld, out, stream); break;
-        case 3: launch_attn_variant<3, true>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, qkv, ld, out, stream); break;
-        case 4: launch_attn_variant<4, true>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, qkv, ld, out, stream); break;
-        case 6: launch_attn_variant<6, true>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, qkv, ld, out, stream); break;
+        case 2: launch_attn_variant<2, true>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, kv_ring, qkv, ld, out, stream); break;
+        case 3: launch_attn_variant<3, true>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, kv_ring, qkv, ld, out, stream); break;
+        case 4: launch_attn_variant<4, true>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, kv_ring, qkv, ld, out, stream); break;
+        case 6: launch_attn_variant<6, true>(q, k, v, T, p0, max_ctx, kv_window, kv_floor, kv_ring, qkv, ld, out, stream); break;
         default: SQ_CHECK(false, "invalid shared-KV attention query tile %d", aq);
     }
 }
@@ -1536,7 +1537,7 @@ void Prefill::mixer_prepared(int il, int T, int p0) {
                     P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il], T, p0, E.kv_capacity_, P.big, ld, P.Y);
         } else {
             launch_attn_prefill(P.shared_attn_kv, P.attn_aq, P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il],
-                                T, p0, E.kv_capacity_, 0, 0, P.big, ld, P.Y, s);
+                                T, p0, E.kv_capacity_, 0, 0, 0, P.big, ld, P.Y, s);
         }
         mark(MixerProfile::ATTN);
         gemm(P.cb, P.W16b, P.Y, P.X, kE, 4096, T, kE, 1.0f);
@@ -1571,14 +1572,14 @@ void Prefill::layer(int il, int T, int p0) {
     } else {
         const int ld = L.qkv.rows;    // 9216
         const int kv_stride = E.kv_stride_for(il);
-        const int kv_ring = E.mtp_kv_capacity() > 0 && il == c.n_layer ? E.mtp_kv_capacity() : 0;
+        const int kv_ring = E.kv_ring_for(il);
         dequant_q8(L.qkv, P.W16, s);
         gemm(P.cb, P.W16, P.Hh, P.big, L.qkv.rows, kE, T, ld, 0.0f);
         attn_prep_rows_kernel<<<dim3(T, kNH + 2 * kNKV), 256, 0, s>>>(P.big, ld, L.q_norm, L.k_norm, eps, p0, c.rope_base,
                                                                       P.Qh, (__half*)E.kc_[il], (__half*)E.vc_[il], kv_stride,
                                                                       kv_ring);
         launch_attn_prefill(P.shared_attn_kv, P.attn_aq, P.Qh, (const __half*)E.kc_[il], (const __half*)E.vc_[il],
-                            T, p0, kv_stride, P.attn_window, P.attn_floor, P.big, ld, P.Y, s);
+                            T, p0, kv_stride, P.attn_window, P.attn_floor, kv_ring, P.big, ld, P.Y, s);
         dequant_q8(L.wo, P.W16, s);
         gemm(P.cb, P.W16, P.Y, P.X, kE, 4096, T, kE, 1.0f);
     }

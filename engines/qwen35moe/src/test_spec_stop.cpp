@@ -147,6 +147,8 @@ int main(int argc, char** argv) {
     options.vram_reserve_mb = 128;
     options.prefill_chunk = 0;
     options.mtp_draft = draft;
+    if (const char* sidecar = std::getenv("STRATA_MTP_MODEL")) options.mtp_model_path = sidecar;
+    if (const char* window = std::getenv("STRATA_MTP_WINDOW")) options.mtp_window = std::atoi(window);
     options.draft_p = 0; // always verify the allocated window; no confidence-based skip can hide the regression
     options.ckpt_slots = 0;
     options.use_graph = false;

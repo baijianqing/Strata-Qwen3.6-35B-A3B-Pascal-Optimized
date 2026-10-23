@@ -70,7 +70,7 @@ __global__ void __launch_bounds__(256) attn_prep_i8_kernel(
     __shared__ float sv[kHD];
     const int b = blockIdx.x, t = threadIdx.x, tk = blockIdx.y;
     const int pos = P->pos + tk;
-    const int slot = P->kv_window > 0 ? pos % max_ctx : pos;   // MTP ring
+    const int slot = P->kv_ring > 0 ? pos % P->kv_ring : pos;   // MTP ring
     qkv += tk * kQKV;
     q_out += tk * kNH * kHD;
     if (b >= kNH + kNKV) {
@@ -123,14 +123,15 @@ __global__ void __launch_bounds__(256) attn_decode_i8_kernel(
     const int key = t >> 2, part = t & 3;
     const int w = t >> 5, lane = t & 31;
     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    const bool ring = P->kv_window > 0;
+    const int ring_slots = P->kv_ring;
     for (int s0 = j0; s0 < j1; s0 += kAttSub) {
         const int n = min(kAttSub, j1 - s0);
-        const int rs = ring ? s0 % max_ctx : s0;
+        const bool ring = ring_slots > 0;
+        const int rs = ring ? s0 % ring_slots : s0;
         float sc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         if (key < n) {
             int kidx = rs + key;
-            if (ring && kidx >= max_ctx) kidx -= max_ctx;
+            if (ring && kidx >= ring_slots) kidx -= ring_slots;
             const size_t head_token = (size_t)kh * max_ctx + kidx;
             const int2* kr = reinterpret_cast<const int2*>(kc + head_token * kHD + part * 64);
             const float dkey = kd[head_token];
@@ -176,7 +177,7 @@ __global__ void __launch_bounds__(256) attn_decode_i8_kernel(
             }
         }
         __syncthreads();
-        const int n1 = ring ? min(n, max_ctx - rs) : n;
+        const int n1 = ring ? min(n, ring_slots - rs) : n;
         const size_t first = (size_t)kh * max_ctx + rs;
         const int8_t* vb = vc + first * kHD + t;
 #pragma unroll

@@ -114,8 +114,15 @@ public:
     bool mtp() const { return mtp_on_; }
     int mtp_draft() const { return mtp_on_ ? draft_ : 0; }
     int mtp_window() const { return mtp_window_; }
-    /// Physical MTP KV ring (0 = full context); equal to the rounded-up --mtp-window when one is set.
+    /// Physical MTP KV allocation (0 = full context); equal to the rounded-up --mtp-window in ring mode.
     int mtp_kv_capacity() const { return mtp_kv_capacity_; }
+    /// MEM_TRACE: KV/cache bytes and peak RSS at a lifecycle boundary (STRATA_MEM_TRACE=0 disables).
+    void mem_trace(const char* point) const;
+    /// MTP KV index ring (0 = absolute positions); can be nonzero while the allocation stays full in emulate mode.
+    int mtp_kv_ring() const { return mtp_kv_ring_; }
+    int kv_ring_for(int il) const {
+        return mtp_kv_ring_ > 0 && il == model_.cfg.n_layer ? mtp_kv_ring_ : 0;
+    }
     /// Drafts per step from now on (0 = plain decoding; at most the --mtp value the engine started with).
     void set_mtp_draft(int d) { draft_ = std::clamp(d, 0, opt_.mtp_draft); }
     /// One speculative step.  `tok` is the token just sampled (not fed yet).  Feeds it plus the accepted drafts and
@@ -144,6 +151,8 @@ public:
     int ckpt_slots() const { return (int)ckpts_.size(); }
     double cache_gib() const { return cache_bytes_ / 1073741824.0; }
     std::string status_line() const;
+    /// Nanoseconds the GPU spent waiting for the CPU router, for per-request profiling deltas.
+    unsigned long long cpu_wait_ns() const;
     /// Per-token expert routes found resident / missing from cache, since the start (T1..4 comparable).
     void expert_counts(uint64_t& resident, uint64_t& missing) const;
     int64_t expert_arena_bytes() const { return model_.expert_bytes; }
@@ -345,7 +354,8 @@ private:
     // MTP
     bool mtp_on_ = false;
     int mtp_window_ = 0;                       // sliding MTP attention window (0 = full)
-    int mtp_kv_capacity_ = 0;                  // fixed MTP KV ring size (0 = same full stride as target layers)
+    int mtp_kv_capacity_ = 0;                  // fixed MTP KV allocation stride (0 = same full stride as target layers)
+    int mtp_kv_ring_ = 0;                      // MTP KV index ring size (0 = absolute positions)
     bool mtp_state_only_ = false;              // scoped catch-up mode: retain MTP state, skip its discarded head
     bool mtp_last_row_ = false;                // single full-attention MTP: earlier pending pairs only require KV
     uint64_t mtp_last_row_steps_ = 0, mtp_kv_only_steps_ = 0;
