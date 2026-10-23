@@ -508,6 +508,7 @@ void Engine::alloc_state() {
     shq_ = alloc_act(T * c.n_ff_shexp);
     hq_ = alloc_act(kMaxU * c.n_ff_exp);
     route_counts_ = dmalloc<uint32_t>((size_t)NL * c.n_expert);
+    miss_expert_counts_.assign((size_t)NL * c.n_expert, 0);
     tok_counts_ = dmalloc<uint32_t>(c.n_vocab);
 
     kc_.assign(NL, nullptr);
@@ -681,6 +682,47 @@ void Engine::trace_row(const char* kind, const char* phase, int tokens, double s
 
 void Engine::trace_event(const char* kind, const char* phase) {
     trace_row(kind, phase, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+std::string Engine::top_miss_experts(int k) const {
+    const size_t NE = (size_t)model_.cfg.n_expert;
+    std::vector<std::pair<uint32_t, size_t>> top;
+    for (size_t i = 0; i < miss_expert_counts_.size(); ++i)
+        if (miss_expert_counts_[i]) top.emplace_back(miss_expert_counts_[i], i);
+    const size_t n = std::min<size_t>(std::max(k, 0), top.size());
+    std::partial_sort(top.begin(), top.begin() + n, top.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string out;
+    for (size_t i = 0; i < n; ++i) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%sL%zu:E%zu=%u", out.empty() ? "" : ",", top[i].second / NE,
+                      top[i].second % NE, (unsigned)top[i].first);
+        out += buf;
+    }
+    return out.empty() ? "-" : out;
+}
+
+uint64_t Engine::miss_pairs() const {
+    uint64_t total = 0;
+    for (uint32_t c : miss_expert_counts_) total += c;
+    return total;
+}
+
+std::string Engine::miss_summary() const {
+    uint64_t total = 0, top10 = 0, top50 = 0;
+    std::vector<uint32_t> counts;
+    counts.reserve(miss_expert_counts_.size());
+    for (uint32_t c : miss_expert_counts_)
+        if (c) { total += c; counts.push_back(c); }
+    const size_t classes = counts.size();
+    std::sort(counts.begin(), counts.end(), [](uint32_t a, uint32_t b) { return a > b; });
+    for (size_t i = 0; i < counts.size() && i < 10; ++i) top10 += counts[i];
+    for (size_t i = 0; i < counts.size() && i < 50; ++i) top50 += counts[i];
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "classes=%zu pairs=%llu top10=%.1f%% top50=%.1f%%", classes,
+                  (unsigned long long)total, total ? 100.0 * top10 / total : 0.0,
+                  total ? 100.0 * top50 / total : 0.0);
+    return buf;
 }
 
 void Engine::mem_trace(const char* point) const {
@@ -1074,7 +1116,8 @@ void Engine::refill_cache_after_prefill(const std::vector<std::vector<int>>& pre
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     if (cache_residency_host_)
         std::memcpy(cache_residency_host_, residency_host_.data(), residency_host_.size() * sizeof(int32_t));
-    log("phase-switched prefill: refilled %lld expert slots (%.1f MiB) from prompt routing, uploaded %.1f MiB",
+    log("phase-switched prefill: restored %lld expert slots (%.1f MiB) from the previous layout "
+        "(prompt routes folded into frequencies), uploaded %.1f MiB",
         (long long)cache_slots_total_, cache_bytes_ / 1048576.0, uploaded / 1048576.0);
 }
 
@@ -1674,7 +1717,14 @@ void Engine::build_layer(cudaStream_t s, int il, int T, const StepParams* P, con
                 const double cw0 = now_ms();
                 cpu_->end_layer(head_last_only_);
                 step_host_cpu_wait_ms_ += now_ms() - cw0;
-                step_misses_ += (uint64_t)mb_host_[il].n_miss;
+                const Mailbox& mm = mb_host_[il];
+                step_misses_ += (uint64_t)mm.n_miss;
+                for (int j = 0; j < mm.n_miss; ++j) {
+                    int rows = 0;
+                    for (int t = 0; t < T; ++t) rows += mm.w[j][t] != 0.f;
+                    if (mm.ids[j] >= 0 && mm.ids[j] < c.n_expert)
+                        miss_expert_counts_[(size_t)il * c.n_expert + mm.ids[j]] += (uint32_t)rows;
+                }
             }
             CUDA_CHECK(cudaStreamSynchronize(s));
         }
@@ -1708,6 +1758,12 @@ void Engine::build_layer(cudaStream_t s, int il, int T, const StepParams* P, con
             cpu_->end_layer(head_last_only_);
             step_host_cpu_wait_ms_ += now_ms() - wait_start;
             step_misses_ += (uint64_t)m.n_miss;
+            for (int j = 0; j < m.n_miss; ++j) {
+                int rows = 0;
+                for (int t = 0; t < T; ++t) rows += m.w[j][t] != 0.f;
+                if (m.ids[j] >= 0 && m.ids[j] < c.n_expert)
+                    miss_expert_counts_[(size_t)il * c.n_expert + m.ids[j]] += (uint32_t)rows;
+            }
             if (profile) {
                 profile->cpu_wait_ms = now_ms() - wait_start;
                 profile->cpu_ms = now_ms() - cpu_started;
@@ -2569,6 +2625,7 @@ void Engine::reset() {
 void Engine::begin_request(const SamplingParams& sp) {
     pen_n_ = sp.penalized() ? (sp.penalty_last_n > 0 ? sp.penalty_last_n : opt_.ctx) : 0;
     pen_hist_.clear();
+    std::fill(miss_expert_counts_.begin(), miss_expert_counts_.end(), 0);
     if (pen_n_ == 0) return;
     const int from = std::max(0, (int)history_.size() - pen_n_);
     pen_hist_.assign(history_.begin() + from, history_.end());

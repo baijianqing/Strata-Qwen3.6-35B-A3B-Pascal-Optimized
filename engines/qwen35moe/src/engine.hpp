@@ -122,6 +122,12 @@ public:
     void mem_trace(const char* point) const;
     /// Opt-in event timeline (STRATA_EVENT_TRACE=path): wall and monotonic timestamps, no-op when disabled.
     void trace_event(const char* kind, const char* phase);
+    /// Most frequent decode expert misses this request, as "L<layer>:E<expert>=<token pairs>".
+    std::string top_miss_experts(int k) const;
+    /// Miss concentration: distinct (layer, expert) classes and the share held by the top 10/50.
+    std::string miss_summary() const;
+    /// Expert×token miss pairs (the histogram total); distinct expert entries are in stats.cpu_misses.
+    uint64_t miss_pairs() const;
     /// MTP KV index ring (0 = absolute positions); can be nonzero while the allocation stays full in emulate mode.
     int mtp_kv_ring() const { return mtp_kv_ring_; }
     int kv_ring_for(int il) const {
@@ -242,6 +248,7 @@ private:
     FILE* trace_fp_ = nullptr;                // STRATA_EVENT_TRACE output (decode timeline)
     double step_host_cpu_wait_ms_ = 0;        // host block inside cpu_->end_layer during this step
     uint64_t step_misses_ = 0;                // expert misses dispatched to CPU workers this step
+    std::vector<uint32_t> miss_expert_counts_; // [layer][expert] decode miss pairs since begin_request
     void rebalance_cache();                  // optional bounded capacity move at a quiescent adapt boundary
     void trim_cache(int64_t bytes);   // drop the coldest cached experts until at least `bytes` are freed
     void check_decode_launch(cudaStream_t s, int il, const char* stage);

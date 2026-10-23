@@ -326,15 +326,17 @@ int serve(Engine& eng, const ServeOptions& so) {
             const double adapt_ms = eng.stats.adapt_ms - adapt_ms0;
             const unsigned long long wait_ms = (eng.cpu_wait_ns() - wait0) / 1000000ull;
             log("DECODE_PROFILE wall_ms=%.1f draft_ms=%.1f verify_ms=%.1f other_ms=%.1f adapt_ms=%.1f "
-                "cpu_wait_ms=%llu cpu_miss_wait_ms=%.1f misses=%llu specs=%llu skipped=%llu drafted=%llu "
-                "accepted=%llu swaps=%llu tokens=%lld",
+                "cpu_wait_ms=%llu cpu_miss_wait_ms=%.1f expert_misses=%llu miss_pairs=%llu specs=%llu "
+                "skipped=%llu drafted=%llu accepted=%llu swaps=%llu tokens=%lld top_miss=%s miss_classes=%s",
                 decode_ms, draft_ms, verify_ms, std::max(0.0, decode_ms - draft_ms - verify_ms - adapt_ms),
                 adapt_ms, wait_ms, eng.stats.cpu_miss_wait_ms - cpu_miss_wait0,
                 (unsigned long long)(eng.stats.cpu_misses - cpu_misses0),
+                (unsigned long long)eng.miss_pairs(),
                 (unsigned long long)(eng.stats.spec_steps - spec0),
                 (unsigned long long)(eng.stats.spec_skipped - skip0),
                 (unsigned long long)(eng.stats.drafted - off0), (unsigned long long)(eng.stats.accepted - acc0),
-                (unsigned long long)(eng.stats.swaps - swaps0), produced);
+                (unsigned long long)(eng.stats.swaps - swaps0), produced, eng.top_miss_experts(6).c_str(),
+                eng.miss_summary().c_str());
         }
         uint64_t hits = 0, miss = 0;
         eng.expert_counts(hits, miss);
