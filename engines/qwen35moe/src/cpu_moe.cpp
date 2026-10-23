@@ -237,8 +237,11 @@ void CpuMoe::start(int n_threads, int n_layer, const std::vector<ExpertLayerDesc
     phase_profile_ = {};
     phase_workers_.reset();
     if (phase_trace_fp_) { std::fclose(phase_trace_fp_); phase_trace_fp_ = nullptr; }
+    if (phase_workers_fp_) { std::fclose(phase_workers_fp_); phase_workers_fp_ = nullptr; }
     const char* phase_trace_path = std::getenv("STRATA_CPU_PHASE_TRACE");
-    if (phase_trace_path && *phase_trace_path) phase_enabled_ = true;
+    const char* phase_workers_path = std::getenv("STRATA_CPU_PHASE_WORKERS");
+    if ((phase_trace_path && *phase_trace_path) || (phase_workers_path && *phase_workers_path))
+        phase_enabled_ = true;
     if (phase_enabled_) {
         phase_skip_ = phase_env_count("STRATA_CPU_PHASE_PROFILE_SKIP", 40, true);
         phase_limit_ = phase_env_count("STRATA_CPU_PHASE_PROFILE_JOBS", 400, false);
@@ -246,10 +249,17 @@ void CpuMoe::start(int n_threads, int n_layer, const std::vector<ExpertLayerDesc
         if (phase_trace_path && *phase_trace_path) {
             phase_trace_fp_ = std::fopen(phase_trace_path, "w");
             SQ_CHECK(phase_trace_fp_, "cannot open STRATA_CPU_PHASE_TRACE %s", phase_trace_path);
-            std::fprintf(phase_trace_fp_, "dispatch_mono_ns,kind,layer,n_tok,n_miss,pairs,"
-                                          "dispatch_to_first_start_ns,start_spread_ns,dispatch_to_last_end_ns,"
-                                          "join_wall_ns,workers_cpu_ns,max_worker_elapsed_ns\n");
+            std::fprintf(phase_trace_fp_, "job_index,dispatch_mono_ns,kind,layer,n_tok,n_miss,pairs,"
+                                          "dispatch_to_first_start_ns,start_spread_ns,end_min_ns,"
+                                          "dispatch_to_last_end_ns,join_wall_ns,workers_cpu_ns,"
+                                          "cpu_max_ns,cpu_min_ns,max_worker_elapsed_ns\n");
             std::fflush(phase_trace_fp_);
+        }
+        if (phase_workers_path && *phase_workers_path) {
+            phase_workers_fp_ = std::fopen(phase_workers_path, "w");
+            SQ_CHECK(phase_workers_fp_, "cannot open STRATA_CPU_PHASE_WORKERS %s", phase_workers_path);
+            std::fprintf(phase_workers_fp_, "job_index,kind,layer,n_tok,tid,start_offset_ns,end_offset_ns,cpu_ns\n");
+            std::fflush(phase_workers_fp_);
         }
         log("CPU phase diagnostics: event-layer jobs only, skip %llu then sample %llu; timings include instrumentation%s",
             (unsigned long long)phase_skip_, (unsigned long long)phase_limit_,
@@ -298,6 +308,7 @@ void CpuMoe::start(int n_threads, int n_layer, const std::vector<ExpertLayerDesc
 
 void CpuMoe::stop() {
     if (phase_trace_fp_) { std::fclose(phase_trace_fp_); phase_trace_fp_ = nullptr; }
+    if (phase_workers_fp_) { std::fclose(phase_workers_fp_); phase_workers_fp_ = nullptr; }
     if (threads_.empty()) { iq3_down_cache_.reset(); phase_workers_.reset(); return; }
     quit_ = true;
     job_gen_.fetch_add(1);
@@ -629,6 +640,7 @@ void CpuMoe::phase_end_layer() {
     // Called strictly after wait_job's acquire. Mailbox, worker counters, and output are immutable here;
     // the next dispatch cannot publish new counters while the sole host is merging this sample.
     const uint64_t wall = phase_now_ns() - phase_start_ns_;
+    const uint64_t job_index = phase_profile_.sampled_jobs;
     const Mailbox& m = mb_[phase_layer_];
     const ExpertLayerDesc& layer = layers_[phase_layer_];
     auto& groups = phase_profile_.groups;
@@ -655,7 +667,9 @@ void CpuMoe::phase_end_layer() {
         job_pairs += nt;
     }
     uint64_t max_worker = 0;
-    uint64_t first_start = UINT64_MAX, last_start = 0, last_end = 0, cpu_sum = 0;
+    uint64_t first_start = UINT64_MAX, last_start = 0, end_min = UINT64_MAX, last_end = 0, cpu_sum = 0;
+    uint64_t cpu_max = 0, cpu_min = UINT64_MAX;
+    int entered = 0;
     for (int tid = 0; tid < n_threads_; ++tid) {
         const auto& source = phase_workers_[tid].counts;
         for (int p = 0; p < CpuPhaseCount; ++p) group.workers.ns[p] += source.ns[p];
@@ -668,22 +682,40 @@ void CpuMoe::phase_end_layer() {
         if (worker.start_offset_ns == 0) continue;   // worker never entered run_layer for this job
         first_start = std::min(first_start, worker.start_offset_ns);
         last_start = std::max(last_start, worker.start_offset_ns);
+        end_min = std::min(end_min, worker.end_offset_ns);
         last_end = std::max(last_end, worker.end_offset_ns);
         cpu_sum += worker.cpu_ns;
+        cpu_max = std::max(cpu_max, worker.cpu_ns);
+        cpu_min = std::min(cpu_min, worker.cpu_ns);
+        ++entered;
+        if (phase_workers_fp_)
+            std::fprintf(phase_workers_fp_, "%llu,%d,%d,%d,%d,%llu,%llu,%llu\n",
+                         (unsigned long long)job_index, job_kind_, phase_layer_, m.n_tok, tid,
+                         (unsigned long long)worker.start_offset_ns,
+                         (unsigned long long)worker.end_offset_ns, (unsigned long long)worker.cpu_ns);
     }
+    if (phase_workers_fp_) std::fflush(phase_workers_fp_);
     if (first_start == UINT64_MAX) first_start = 0;
+    if (end_min == UINT64_MAX) end_min = 0;
+    if (cpu_min == UINT64_MAX) cpu_min = 0;
     group.max_worker_ns += max_worker;
     group.dispatch_to_first_start_ns += first_start;
     group.start_spread_ns += last_start - first_start;
+    group.end_spread_ns += last_end - end_min;
     group.dispatch_to_last_end_ns += last_end;
     group.worker_cpu_ns += cpu_sum;
+    group.worker_jobs += (uint64_t)entered;
+    group.max_worker_cpu_ns += cpu_max;
+    group.min_worker_cpu_ns += cpu_min;
     if (phase_trace_fp_) {
         std::fprintf(phase_trace_fp_,
-                     "%llu,%d,%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
-                     (unsigned long long)phase_dispatch_ns_, job_kind_, phase_layer_, m.n_tok,
-                     m.n_miss, (unsigned long long)job_pairs, (unsigned long long)first_start,
-                     (unsigned long long)(last_start - first_start), (unsigned long long)last_end,
-                     (unsigned long long)wall, (unsigned long long)cpu_sum, (unsigned long long)max_worker);
+                     "%llu,%llu,%d,%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                     (unsigned long long)job_index, (unsigned long long)phase_dispatch_ns_, job_kind_,
+                     phase_layer_, m.n_tok, m.n_miss, (unsigned long long)job_pairs,
+                     (unsigned long long)first_start, (unsigned long long)(last_start - first_start),
+                     (unsigned long long)end_min, (unsigned long long)last_end, (unsigned long long)wall,
+                     (unsigned long long)cpu_sum, (unsigned long long)cpu_max, (unsigned long long)cpu_min,
+                     (unsigned long long)max_worker);
         std::fflush(phase_trace_fp_);
     }
     phase_active_ = false;
@@ -702,9 +734,15 @@ void CpuMoe::phase_log(bool partial) {
     for (const auto& group : phase_profile_.groups) {
         const auto& ns = group.workers.ns;
         const double jobs = (double)std::max<uint64_t>(group.jobs, 1);
+        const double cpu_mean_us = group.worker_jobs ? (double)group.worker_cpu_ns / group.worker_jobs / 1000.0 : 0.0;
+        const double cpu_max_us = (double)group.max_worker_cpu_ns / jobs / 1000.0;
+        const double cpu_min_us = (double)group.min_worker_cpu_ns / jobs / 1000.0;
+        const double util = group.dispatch_to_join_ns
+            ? (double)group.worker_cpu_ns / ((double)group.dispatch_to_join_ns * n_threads_) : 0.0;
         log("CPU_PHASE kind=%d T=%d GU=%u DOWN=%u jobs=%llu missing=%llu pairs=%llu expertNT0..4=%llu,%llu,%llu,%llu,%llu "
-            "wall_ms=%.6f max_worker_ms=%.6f worker_ms=%.6f start_us=%.3f spread_us=%.3f last_end_us=%.3f "
-            "worker_cpu_ms=%.3f cpu_per_wall=%.2f pack_gu_ms=%.6f gu_ms=%.6f gu_barrier_ms=%.6f "
+            "wall_ms=%.6f max_worker_ms=%.6f worker_jobs=%llu cpu_mean_us=%.1f cpu_max_mean_us=%.1f "
+            "cpu_min_mean_us=%.1f max_over_mean=%.3f worker_util=%.3f start_us=%.3f start_spread_us=%.1f "
+            "end_spread_us=%.1f last_end_us=%.3f pack_gu_ms=%.6f gu_ms=%.6f gu_barrier_ms=%.6f "
             "pack_down_ms=%.6f down_ms=%.6f reduce_ms=%.6f down_fused_ms=%.6f "
             "gu_quant_tokens=%llu down_quant_pairs=%llu gu_row_pairs=%llu down_row_pairs=%llu",
             group.kind, group.n_tok, group.t_gu, group.t_down, (unsigned long long)group.jobs,
@@ -712,10 +750,11 @@ void CpuMoe::phase_log(bool partial) {
             (unsigned long long)group.expert_nt[0], (unsigned long long)group.expert_nt[1],
             (unsigned long long)group.expert_nt[2], (unsigned long long)group.expert_nt[3],
             (unsigned long long)group.expert_nt[4],
-            group.dispatch_to_join_ns * 1e-6, group.max_worker_ns * 1e-6, ns[CpuWorkerTotal] * 1e-6,
+            group.dispatch_to_join_ns * 1e-6, group.max_worker_ns * 1e-6,
+            (unsigned long long)group.worker_jobs, cpu_mean_us, cpu_max_us, cpu_min_us,
+            cpu_mean_us > 0 ? cpu_max_us / cpu_mean_us : 0.0, util,
             group.dispatch_to_first_start_ns / jobs / 1000.0, group.start_spread_ns / jobs / 1000.0,
-            group.dispatch_to_last_end_ns / jobs / 1000.0, group.worker_cpu_ns / jobs / 1e6,
-            group.dispatch_to_join_ns ? (double)group.worker_cpu_ns / group.dispatch_to_join_ns : 0.0,
+            group.end_spread_ns / jobs / 1000.0, group.dispatch_to_last_end_ns / jobs / 1000.0,
             ns[CpuPackGU] * 1e-6, ns[CpuGU] * 1e-6, ns[CpuGUBarrier] * 1e-6,
             ns[CpuPackDown] * 1e-6, ns[CpuDown] * 1e-6, ns[CpuReduce] * 1e-6, ns[CpuDownFused] * 1e-6,
             (unsigned long long)group.workers.gu_quant_tokens, (unsigned long long)group.workers.down_quant_pairs,

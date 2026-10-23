@@ -100,7 +100,11 @@ struct CpuMoePhaseGroup {
     uint64_t dispatch_to_first_start_ns = 0; // host dispatch -> first worker enters run_layer
     uint64_t start_spread_ns = 0;            // first worker start -> last worker start
     uint64_t dispatch_to_last_end_ns = 0;    // host dispatch -> last worker leaves run_layer
+    uint64_t end_spread_ns = 0;              // first worker end -> last worker end (sum over jobs)
     uint64_t worker_cpu_ns = 0;              // summed thread CPU time across workers
+    uint64_t worker_jobs = 0;                // number of (job, worker) pairs that entered run_layer
+    uint64_t max_worker_cpu_ns = 0;          // sum over jobs of the job's max per-worker CPU time
+    uint64_t min_worker_cpu_ns = 0;          // sum over jobs of the job's min per-worker CPU time
     CpuMoePhaseCounts workers;
 };
 struct CpuMoePhaseProfile {
@@ -171,6 +175,7 @@ private:
     int phase_layer_ = -1, job_kind_ = 0;
     uint64_t phase_skip_ = 40, phase_limit_ = 400, phase_start_ns_ = 0, phase_dispatch_ns_ = 0;
     FILE* phase_trace_fp_ = nullptr;            // STRATA_CPU_PHASE_TRACE: one row per sampled job
+    FILE* phase_workers_fp_ = nullptr;          // STRATA_CPU_PHASE_WORKERS: one row per worker per job
     struct alignas(64) PhaseWorker {
         CpuMoePhaseCounts counts;
         uint64_t start_offset_ns = 0, end_offset_ns = 0, cpu_ns = 0;
