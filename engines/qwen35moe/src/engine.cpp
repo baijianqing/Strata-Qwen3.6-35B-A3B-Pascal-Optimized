@@ -2342,7 +2342,8 @@ std::vector<float> Engine::debug_verify(const int* tokens, int T, int keep) {
     return h;
 }
 
-Engine::CpuExpertBench Engine::debug_cpu_expert_bench(int layer, int tokens, int distinct_experts, int iterations) {
+Engine::CpuExpertBench Engine::debug_cpu_expert_bench(int layer, int tokens, int distinct_experts, int iterations,
+                                                      int warmups, int expert_offset) {
     const Config& c = model_.cfg;
     SQ_CHECK(layer >= 0 && layer < c.n_moe_layers(), "cpu bench: invalid layer %d", layer);
     SQ_CHECK(tokens >= 1 && tokens <= kMaxT, "cpu bench: invalid token count %d", tokens);
@@ -2356,7 +2357,7 @@ Engine::CpuExpertBench Engine::debug_cpu_expert_bench(int layer, int tokens, int
     m.n_tok = tokens;
     m.n_miss = distinct_experts;
     for (int j = 0; j < distinct_experts; ++j) {
-        m.ids[j] = (j * 7 + 3) % c.n_expert;   // 7 is coprime with 256: distinct ids
+        m.ids[j] = (expert_offset + j) % c.n_expert;   // contiguous distinct ids; offsets select fresh sets
         for (int t = 0; t < kMaxT; ++t) m.w[j][t] = 0.0f;
         for (int r = 0; r < rows; ++r) m.w[j][(j * rows + r) % tokens] = 1.0f;
     }
@@ -2373,7 +2374,7 @@ Engine::CpuExpertBench Engine::debug_cpu_expert_bench(int layer, int tokens, int
         cpu_->end_layer(false);
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     };
-    for (int i = 0; i < 3; ++i) (void)run();
+    for (int i = 0; i < warmups; ++i) (void)run();
     std::vector<double> times;
     times.reserve((size_t)iterations);
     for (int i = 0; i < iterations; ++i) times.push_back(run());

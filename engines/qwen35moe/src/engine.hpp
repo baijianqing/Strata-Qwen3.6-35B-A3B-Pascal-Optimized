@@ -232,7 +232,8 @@ public:
     std::vector<float> debug_verify(const int* tokens, int T, int keep);
     /// Controlled CPU expert job: fixed token-major pairs, variable distinct-expert working set.
     struct CpuExpertBench { double median_ms = 0, mean_ms = 0; int pairs = 0; };
-    CpuExpertBench debug_cpu_expert_bench(int layer, int tokens, int distinct_experts, int iterations);
+    CpuExpertBench debug_cpu_expert_bench(int layer, int tokens, int distinct_experts, int iterations,
+                                          int warmups = 3, int expert_offset = 0);
     std::vector<std::vector<float>>* debug_layers = nullptr;   // --no-graph only: token 0's x after every layer
 
 private:
