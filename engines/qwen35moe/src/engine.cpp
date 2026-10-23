@@ -67,6 +67,7 @@ constexpr uint32_t kProfileMagic = 0x50455153;   // "SQEP"
 Engine::Engine() = default;
 
 Engine::~Engine() {
+    if (trace_fp_) { std::fclose(trace_fp_); trace_fp_ = nullptr; }
     // Graph host callbacks may still need the CPU pool. Drain every graph branch before stopping its workers.
     if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     if (miss_copy_stream_) cudaStreamSynchronize(miss_copy_stream_);
@@ -116,6 +117,15 @@ Engine::~Engine() {
 
 bool Engine::init(const EngineOptions& opt, std::string& err) {
     opt_ = opt;
+    if (const char* trace_path = std::getenv("STRATA_EVENT_TRACE")) {
+        if (*trace_path) {
+            trace_fp_ = std::fopen(trace_path, "w");
+            SQ_CHECK(trace_fp_, "cannot open STRATA_EVENT_TRACE %s", trace_path);
+            std::fprintf(trace_fp_, "wall_ns,mono_ns,kind,phase,seq,pos,tokens,submit_ms,sync_ms,join_ms,"
+                                    "draft_ms,verify_ms,adapt_ms,cpu_wait_ms,accepted,drafted,misses\n");
+            std::fflush(trace_fp_);
+        }
+    }
     prefill_phase_switch_ = env_mib("STRATA_PREFILL_PHASE_SWITCH", 1, 1) != 0;
     prefill_snapshot_loan_ = env_mib("STRATA_PREFILL_SNAPSHOT_LOAN", 1, 1) != 0;
     SQ_CHECK(!prefill_snapshot_loan_ || prefill_phase_switch_,
@@ -651,6 +661,26 @@ void Engine::ensure_kv_capacity(int tokens) {
     log("KV capacity grew %d -> %d / %d tokens: +%.1f MiB, expert cache %.1f -> %.1f MiB, %.1f ms",
         previous, capacity, opt_.ctx, extra / 1048576.0, cache_before / 1048576.0, cache_bytes_ / 1048576.0,
         now_ms() - started);
+}
+
+void Engine::trace_row(const char* kind, const char* phase, int tokens, double submit_ms, double sync_ms,
+                       double join_ms, double draft_ms, double verify_ms, double adapt_ms, double cpu_wait_ms,
+                       int accepted, int drafted, uint64_t misses) {
+    if (!trace_fp_) return;
+    const auto wall = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto mono = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::fprintf(trace_fp_,
+                 "%lld,%lld,%s,%s,%u,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%llu\n",
+                 (long long)wall, (long long)mono, kind, phase, seq_, n_past_, tokens, submit_ms, sync_ms,
+                 join_ms, draft_ms, verify_ms, adapt_ms, cpu_wait_ms, accepted, drafted,
+                 (unsigned long long)misses);
+    std::fflush(trace_fp_);
+}
+
+void Engine::trace_event(const char* kind, const char* phase) {
+    trace_row(kind, phase, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 void Engine::mem_trace(const char* point) const {
@@ -1640,7 +1670,12 @@ void Engine::build_layer(cudaStream_t s, int il, int T, const StepParams* P, con
         if (miss_stream_serialized_) {
             // Test reference: transfer completed before CPU dispatch; finish both earlier branches before
             // executing the transient experts. Their inputs, kernels, order and selected IDs are identical.
-            if (mb_host_[il].n_miss > 0) cpu_->end_layer(head_last_only_);
+            if (mb_host_[il].n_miss > 0) {
+                const double cw0 = now_ms();
+                cpu_->end_layer(head_last_only_);
+                step_host_cpu_wait_ms_ += now_ms() - cw0;
+                step_misses_ += (uint64_t)mb_host_[il].n_miss;
+            }
             CUDA_CHECK(cudaStreamSynchronize(s));
         }
         CUDA_CHECK(cudaStreamWaitEvent(s, miss_stream_ready_, 0));
@@ -1669,8 +1704,10 @@ void Engine::build_layer(cudaStream_t s, int il, int T, const StepParams* P, con
         // completion flag and all output rows before combine.  The single device result buffer is stream-ordered.
         const Mailbox& m = mb_host_[il];
         if (m.n_miss > 0) {
-            const double wait_start = profile ? now_ms() : 0;
+            const double wait_start = now_ms();
             cpu_->end_layer(head_last_only_);
+            step_host_cpu_wait_ms_ += now_ms() - wait_start;
+            step_misses_ += (uint64_t)m.n_miss;
             if (profile) {
                 profile->cpu_wait_ms = now_ms() - wait_start;
                 profile->cpu_ms = now_ms() - cpu_started;
@@ -1922,6 +1959,9 @@ void Engine::capture_prompt_full_graph(bool skip_head) {
 void Engine::run_step(bool mtp, int T) {
     const Config& c = model_.cfg;
     const double profile_start = profile_pipeline_ ? now_ms() : 0;
+    const double step_start = now_ms();
+    step_host_cpu_wait_ms_ = 0;
+    step_misses_ = 0;
     SQ_CHECK(!sync_moe_ || (!mtp && T == 1), "STRATA_SYNC_MOE=1 requires single-token decode with MTP disabled");
     StepParams& P = mtp ? *mparams_host_ : *params_host_;
     ensure_kv_capacity(P.pos + T); // final guard covers trunk verification and every pending/recursive MTP write
@@ -1955,6 +1995,7 @@ void Engine::run_step(bool mtp, int T) {
     else if (mtp) build_mtp(stream_, T);
     else build_decode(stream_, T);
     if (profile_pipeline_) CUDA_CHECK(cudaEventRecord(pipeline_end_, stream_));
+    const double submit_end = now_ms();
     if (prompt_full) {
         // The event follows every CPU callback/result-copy/GPU join and the optional final head. Keep the
         // main host asleep while the CUDA callback thread dispatches/waits on the ordinary worker pool.
@@ -1966,7 +2007,13 @@ void Engine::run_step(bool mtp, int T) {
         CUDA_CHECK(cudaEventRecord(event_graph_complete_, stream_));
         CUDA_CHECK(cudaEventSynchronize(event_graph_complete_));
     } else CUDA_CHECK(cudaStreamSynchronize(stream_));
+    const double sync_end = now_ms();
     const bool cpu_ok = sync_moe_ || event_moe_ || cpu_->end_step();
+    const double join_end = now_ms();
+    stats.cpu_miss_wait_ms += step_host_cpu_wait_ms_;
+    stats.cpu_misses += step_misses_;
+    trace_row("step", mtp ? "mtp" : "trunk", T, submit_end - step_start, sync_end - submit_end,
+              join_end - sync_end, 0, 0, 0, step_host_cpu_wait_ms_, 0, 0, step_misses_);
     if (!cpu_ok || tok_host_[1] != 0) {
         std::string lay;
         for (int l = 0; l < c.n_moe_layers(); ++l) {
@@ -2155,7 +2202,8 @@ void Engine::spec_step(int tok, const SamplingParams& sp, std::mt19937_64& rng, 
     // ---- verify [tok, drafts] in one trunk step
     const int T = D + 1;
     decode_multi(toks, T);
-    stats.verify_ms += now_ms() - t1;
+    const double verify_step = now_ms() - t1;
+    stats.verify_ms += verify_step;
     // ---- accept: row i of the logits predicts the token after toks[i]
     int a = 0;         // tokens of the step kept (tok + accepted drafts)
     int bonus = -1;    // the trunk's own token after them
@@ -2198,12 +2246,15 @@ void Engine::spec_step(int tok, const SamplingParams& sp, std::mt19937_64& rng, 
     stats.drafted += D;
     stats.accepted += a - 1;
     steps_since_adapt_ += a;
+    double adapt_step = 0;
     if (opt_.adapt_every > 0 && cache_slots_total_ > 0 && steps_since_adapt_ >= opt_.adapt_every) {
         steps_since_adapt_ = 0;
         const double ta = now_ms();
         adapt_cache();
-        stats.adapt_ms += now_ms() - ta;
+        adapt_step = now_ms() - ta;
+        stats.adapt_ms += adapt_step;
     }
+    trace_row("spec", "", (int)out.size(), 0, 0, 0, t1 - t0, verify_step, adapt_step, 0, a - 1, D, 0);
 }
 
 void Engine::commit_step(const int* toks, int a, int T) {

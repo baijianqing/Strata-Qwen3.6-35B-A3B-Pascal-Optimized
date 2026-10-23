@@ -239,6 +239,8 @@ int serve(Engine& eng, const ServeOptions& so) {
         const uint64_t swaps0 = eng.stats.swaps;
         const uint64_t spec0 = eng.stats.spec_steps, skip0 = eng.stats.spec_skipped;
         const double adapt_ms0 = eng.stats.adapt_ms, mtp_ms0 = eng.stats.mtp_ms, verify_ms0 = eng.stats.verify_ms;
+        const double cpu_miss_wait0 = eng.stats.cpu_miss_wait_ms;
+        const uint64_t cpu_misses0 = eng.stats.cpu_misses;
         const unsigned long long wait0 = eng.cpu_wait_ns();
 
         // ---- the prompt: what a checkpoint or the live state already holds, then the rest in slices
@@ -279,7 +281,9 @@ int serve(Engine& eng, const ServeOptions& so) {
             int end = std::min(pos + feed_chunk, n);
             for (int c : cks)
                 if (c > pos && c < end) { end = c; break; }
+            eng.trace_event("phase", "prefill_start");
             eng.feed(ids.data() + pos, end - pos);
+            eng.trace_event("phase", "prefill_end");
             pos = end;
             if (std::find(cks.begin(), cks.end(), pos) != cks.end()) eng.save_checkpoint(pos == base_ck);
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -296,11 +300,13 @@ int serve(Engine& eng, const ServeOptions& so) {
         // ---- the answer: each round emits the tokens after the last one emitted (one sampled token, or with MTP the
         // accepted drafts and the trunk's next token); the last of them is fed by the next round
         eng.begin_request(sp);
+        eng.trace_event("phase", "decode_start");
         long long produced = 0;
         const char* finish = "length";
         std::vector<int> next{eng.sample(sp, rng)};
         for (bool done = false; !done;) {
             for (int tok : next) {
+                eng.trace_event("token", "emit");
                 emit("T %d", tok);
                 ++produced;
                 if (std::find(so.eos.begin(), so.eos.end(), tok) != so.eos.end()) { finish = "stop"; done = true; break; }
@@ -311,6 +317,7 @@ int serve(Engine& eng, const ServeOptions& so) {
             eng.spec_step(next.back(), sp, rng, next, &so.eos, (int)(max_new - produced));
         }
         const auto t2 = Clock::now();
+        eng.trace_event("phase", "decode_end");
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
         {
@@ -319,9 +326,12 @@ int serve(Engine& eng, const ServeOptions& so) {
             const double adapt_ms = eng.stats.adapt_ms - adapt_ms0;
             const unsigned long long wait_ms = (eng.cpu_wait_ns() - wait0) / 1000000ull;
             log("DECODE_PROFILE wall_ms=%.1f draft_ms=%.1f verify_ms=%.1f other_ms=%.1f adapt_ms=%.1f "
-                "cpu_wait_ms=%llu specs=%llu skipped=%llu drafted=%llu accepted=%llu swaps=%llu tokens=%lld",
+                "cpu_wait_ms=%llu cpu_miss_wait_ms=%.1f misses=%llu specs=%llu skipped=%llu drafted=%llu "
+                "accepted=%llu swaps=%llu tokens=%lld",
                 decode_ms, draft_ms, verify_ms, std::max(0.0, decode_ms - draft_ms - verify_ms - adapt_ms),
-                adapt_ms, wait_ms, (unsigned long long)(eng.stats.spec_steps - spec0),
+                adapt_ms, wait_ms, eng.stats.cpu_miss_wait_ms - cpu_miss_wait0,
+                (unsigned long long)(eng.stats.cpu_misses - cpu_misses0),
+                (unsigned long long)(eng.stats.spec_steps - spec0),
                 (unsigned long long)(eng.stats.spec_skipped - skip0),
                 (unsigned long long)(eng.stats.drafted - off0), (unsigned long long)(eng.stats.accepted - acc0),
                 (unsigned long long)(eng.stats.swaps - swaps0), produced);
@@ -898,6 +908,7 @@ int main(int argc, char** argv) {
     Engine eng;
     std::string err;
     if (!eng.init(opt, err)) die("%s", err.c_str());
+    eng.trace_event("phase", "ready");
     if (short_parity) return short_parity_check(eng, ids_s, n_gen);
     if (layer_major_requested) return selfcheck_layer_major(eng, layer_major_check);
     if (mtp_ring_requested) return selfcheck_mtp_ring(eng, mtp_ring_check);

@@ -84,6 +84,8 @@ struct EngineStats {
     uint64_t spec_skipped = 0;               // steps where the first draft was too unlikely to verify
     double mtp_ms = 0;                       // time in the MTP block (drafting + pending pairs)
     double verify_ms = 0;                    // time in verification steps (trunk over token + drafts)
+    double cpu_miss_wait_ms = 0;             // host time blocked in cpu_->end_layer (expert misses)
+    uint64_t cpu_misses = 0;                 // expert/token miss pairs dispatched to CPU workers
     std::vector<float> step_ms;              // recent per-token decode times (ring), for a noise-robust median
 };
 
@@ -118,6 +120,8 @@ public:
     int mtp_kv_capacity() const { return mtp_kv_capacity_; }
     /// MEM_TRACE: KV/cache bytes and peak RSS at a lifecycle boundary (STRATA_MEM_TRACE=0 disables).
     void mem_trace(const char* point) const;
+    /// Opt-in event timeline (STRATA_EVENT_TRACE=path): wall and monotonic timestamps, no-op when disabled.
+    void trace_event(const char* kind, const char* phase);
     /// MTP KV index ring (0 = absolute positions); can be nonzero while the allocation stays full in emulate mode.
     int mtp_kv_ring() const { return mtp_kv_ring_; }
     int kv_ring_for(int il) const {
@@ -232,6 +236,12 @@ private:
     void setup_miss_stream();                // freeze initially nonresident profile leaders after cache allocation
     int prepare_miss_stream(int layer, int T, cudaStream_t s); // partition completed mailbox, queue bounded DMA
     void ensure_kv_capacity(int tokens);      // grow backing storage without lowering the configured context
+    void trace_row(const char* kind, const char* phase, int tokens, double submit_ms, double sync_ms,
+                   double join_ms, double draft_ms, double verify_ms, double adapt_ms, double cpu_wait_ms,
+                   int accepted, int drafted, uint64_t misses);
+    FILE* trace_fp_ = nullptr;                // STRATA_EVENT_TRACE output (decode timeline)
+    double step_host_cpu_wait_ms_ = 0;        // host block inside cpu_->end_layer during this step
+    uint64_t step_misses_ = 0;                // expert misses dispatched to CPU workers this step
     void rebalance_cache();                  // optional bounded capacity move at a quiescent adapt boundary
     void trim_cache(int64_t bytes);   // drop the coldest cached experts until at least `bytes` are freed
     void check_decode_launch(cudaStream_t s, int il, const char* stage);
