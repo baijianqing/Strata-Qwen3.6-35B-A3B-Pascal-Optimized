@@ -13,6 +13,7 @@
 #include <unistd.h>
 #endif
 
+#include <cerrno>
 #include <cstring>
 
 namespace sq {
@@ -79,23 +80,31 @@ void GgufFile::close() {
     for (auto& t : tensors_) t.data = nullptr;
 }
 
-void GgufFile::drop_pages(const GgufTensor& t) const {
+bool GgufFile::drop_pages(const GgufTensor& t) const {
 #ifndef _WIN32
-    if (!base_ || !t.data || t.bytes <= 0) return;
+    if (!base_ || !t.data || t.bytes <= 0) return true;
     const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) return;
+    if (page <= 0) return false;
     const uintptr_t begin = (uintptr_t)t.data & ~(uintptr_t)(page - 1);
     const uintptr_t end = ((uintptr_t)t.data + (uintptr_t)t.bytes + (uintptr_t)page - 1) &
                           ~(uintptr_t)(page - 1);
-    if (end > begin) madvise((void*)begin, (size_t)(end - begin), MADV_DONTNEED);
+    if (end <= begin) return true;
+    return madvise((void*)begin, (size_t)(end - begin), MADV_DONTNEED) == 0;
 #else
     (void)t;
+    return true;
 #endif
 }
 
 void GgufFile::drop_pages_except(const std::string& keep) const {
-    for (const auto& t : tensors_)
-        if (t.name != keep) drop_pages(t);
+    std::string failed;
+    for (const auto& t : tensors_) {
+        if (t.name == keep) continue;
+        if (!drop_pages(t) && failed.empty()) failed = t.name;
+    }
+    if (!failed.empty())
+        log("warning: cannot release mapped pages of %s (%s); load continues", failed.c_str(),
+            std::strerror(errno));
 }
 
 bool GgufFile::open(const std::string& path, std::string& err) {

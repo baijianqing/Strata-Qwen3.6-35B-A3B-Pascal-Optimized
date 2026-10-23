@@ -39,9 +39,11 @@ public:
     void close();
     /// Drops one tensor's file-backed pages from this process's working set.  The bytes stay in the page cache
     /// and are re-read on demand; this only stops a fully consumed load from holding the whole GGUF resident
-    /// next to the pinned expert arena.  No-op on Windows and once the mapping is closed.
-    void drop_pages(const GgufTensor& t) const;
+    /// next to the pinned expert arena.  Returns false if madvise reported an error.  No-op on Windows and
+    /// once the mapping is closed.
+    bool drop_pages(const GgufTensor& t) const;
     /// Drops every mapped tensor's pages except `keep` (e.g. token_embd, which is read per token after load).
+    /// Logs once if any call fails; the load stays correct because the pages are only advisory.
     void drop_pages_except(const std::string& keep) const;
 
     const GgufTensor* tensor(const std::string& name) const;
