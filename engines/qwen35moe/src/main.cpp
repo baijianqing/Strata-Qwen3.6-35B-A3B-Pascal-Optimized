@@ -104,6 +104,7 @@ void usage() {
         "  --selfcheck N      logits of a random N-token prompt: batched prefill vs prefill(N-1) + decode(1)\n"
         "  --selfcheck-layer-major N  chunk/layer-major parity, continuation, prefix reuse and MTP rollback;\n"
         "  --selfcheck-mtp-ring N     MTP KV ring draft/rollback/restore checks around window boundaries;\n"
+        "  --selfcheck-cpu-reuse      synthetic CPU expert jobs: 32 pairs over 8/16/32 distinct experts;\n"
         "                     N >= 16; forces deferred MMQ prefill, no adaptation, >=1 checkpoint; fails if KL > .01\n"
         "                     STRATA_LAYER_PARITY_REFERENCE_CHUNK overrides reference chunk size;\n"
         "                     STRATA_LAYER_PARITY_CONTROL=1 compares two chunk-major paths instead\n"
@@ -814,6 +815,7 @@ int main(int argc, char** argv) {
     int n_gen = 32, bench_prompt = 512, selfcheck = 0, layer_major_check = 0, mtp_ring_check = 0;
     bool do_serve = false, do_bench = false, spec_check = false, layer_major_requested = false;
     bool mtp_ring_requested = false;
+    bool cpu_reuse_requested = false;
     bool short_parity = false;
     SamplingParams sp;
     for (int i = 1; i < argc; ++i) {
@@ -867,6 +869,7 @@ int main(int argc, char** argv) {
             mtp_ring_check = std::stoi(next());
             mtp_ring_requested = true;
         }
+        else if (a == "--selfcheck-cpu-reuse") cpu_reuse_requested = true;
         else if (a == "--temp") sp.temperature = std::stof(next());
         else if (a == "--top-k") sp.top_k = std::stoi(next());
         else if (a == "--top-p") sp.top_p = std::stof(next());
@@ -906,6 +909,12 @@ int main(int argc, char** argv) {
         opt.use_graph = false;
         opt.ckpt_slots = std::max(opt.ckpt_slots, 1);
     }
+    if (cpu_reuse_requested) {
+        SQ_CHECK(!do_serve && !do_bench && !spec_check && selfcheck == 0 && !layer_major_requested &&
+                     !mtp_ring_requested && ids_s.empty(), "--selfcheck-cpu-reuse is a standalone check");
+        opt.adapt_every = 0;
+        opt.use_graph = false;
+    }
     if (!so.profile_save.empty() && std::ifstream(so.profile_save).good()) opt.profile_path = so.profile_save;
     Engine eng;
     std::string err;
@@ -914,6 +923,26 @@ int main(int argc, char** argv) {
     if (short_parity) return short_parity_check(eng, ids_s, n_gen);
     if (layer_major_requested) return selfcheck_layer_major(eng, layer_major_check);
     if (mtp_ring_requested) return selfcheck_mtp_ring(eng, mtp_ring_check);
+    if (cpu_reuse_requested) {
+        const int used = eng.cfg().n_expert_used;
+        const int tokens = 4;
+        const int ks[3] = {used, 2 * used, 4 * used};
+        const int layer = std::min(20, eng.cfg().n_moe_layers() - 1);
+        double med[2][3] = {};
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int i = 0; i < 3; ++i) {
+                const int k = ks[pass == 0 ? i : 2 - i];
+                const auto r = eng.debug_cpu_expert_bench(layer, tokens, k, 15);
+                med[pass][pass == 0 ? i : 2 - i] = r.median_ms;
+                std::printf("CPU_REUSE pass=%d layer=%d tokens=%d pairs=%d distinct=%d median_ms=%.4f "
+                            "mean_ms=%.4f us_per_pair=%.2f\n", pass, layer, tokens, r.pairs, k,
+                            r.median_ms, r.mean_ms, r.median_ms * 1000.0 / r.pairs);
+            }
+        }
+        const double r0 = med[0][2] / med[0][0], r1 = med[1][2] / med[1][0];
+        std::printf("CPU_REUSE distinct32_over_8 pass0=%.3f pass1=%.3f\n", r0, r1);
+        return 0;
+    }
     if (do_serve) return serve(eng, so);
     if (selfcheck > 1) {
         std::mt19937 rng(7);

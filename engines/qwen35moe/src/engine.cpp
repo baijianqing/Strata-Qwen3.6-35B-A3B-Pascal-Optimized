@@ -2342,6 +2342,51 @@ std::vector<float> Engine::debug_verify(const int* tokens, int T, int keep) {
     return h;
 }
 
+Engine::CpuExpertBench Engine::debug_cpu_expert_bench(int layer, int tokens, int distinct_experts, int iterations) {
+    const Config& c = model_.cfg;
+    SQ_CHECK(layer >= 0 && layer < c.n_moe_layers(), "cpu bench: invalid layer %d", layer);
+    SQ_CHECK(tokens >= 1 && tokens <= kMaxT, "cpu bench: invalid token count %d", tokens);
+    SQ_CHECK(iterations >= 1, "cpu bench: iterations must be positive");
+    const int pairs = tokens * c.n_expert_used;
+    SQ_CHECK(distinct_experts >= tokens && distinct_experts <= kMaxU && pairs % distinct_experts == 0,
+             "cpu bench: distinct experts %d cannot hold %d pairs over %d tokens", distinct_experts, pairs, tokens);
+    const int rows = pairs / distinct_experts;
+    SQ_CHECK(rows <= tokens, "cpu bench: %d rows per expert exceeds %d tokens", rows, tokens);
+    Mailbox& m = mb_host_[layer];
+    m.n_tok = tokens;
+    m.n_miss = distinct_experts;
+    for (int j = 0; j < distinct_experts; ++j) {
+        m.ids[j] = (j * 7 + 3) % c.n_expert;   // 7 is coprime with 256: distinct ids
+        for (int t = 0; t < kMaxT; ++t) m.w[j][t] = 0.0f;
+        for (int r = 0; r < rows; ++r) m.w[j][(j * rows + r) % tokens] = 1.0f;
+    }
+    uint32_t seed = 12345;
+    for (int t = 0; t < tokens; ++t)
+        for (int d = 0; d < c.n_embd; ++d) {
+            seed = seed * 1664525u + 1013904223u;
+            m.x[t][d] = (float)((seed >> 8) & 0xffff) / 65536.0f - 0.5f;
+        }
+    cpu_->set_job_kind(0);
+    auto run = [&] {
+        const auto t0 = std::chrono::steady_clock::now();
+        cpu_->begin_layer(layer);
+        cpu_->end_layer(false);
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    for (int i = 0; i < 3; ++i) (void)run();
+    std::vector<double> times;
+    times.reserve((size_t)iterations);
+    for (int i = 0; i < iterations; ++i) times.push_back(run());
+    std::sort(times.begin(), times.end());
+    CpuExpertBench result;
+    result.pairs = pairs;
+    result.median_ms = times[times.size() / 2];
+    double sum = 0;
+    for (double v : times) sum += v;
+    result.mean_ms = sum / times.size();
+    return result;
+}
+
 void Engine::feed(const int* tokens, int n) {
     if (n <= 0) return;
     SQ_CHECK(n_past_ + n <= opt_.ctx, "prompt exceeds the context (%d + %d > %d)", n_past_, n, opt_.ctx);
