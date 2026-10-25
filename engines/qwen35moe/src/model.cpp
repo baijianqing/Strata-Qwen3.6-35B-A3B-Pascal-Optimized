@@ -96,6 +96,7 @@ Model::~Model() {
     if (head_qs_pin_) cudaHostUnregister(head_qs_pin_);
     if (head_d_pin_) cudaHostUnregister(head_d_pin_);
     if (head_dev_) cudaFree(head_dev_);
+    for (auto* p : dspark_ptrs_) if (p) cudaFree(p);
     if (dev_arena_) cudaFree(dev_arena_);
     for (auto* p : pinned_) cudaFreeHost(p);
     for (auto* p : pageable_) std::free(p);
@@ -236,6 +237,13 @@ bool Model::flush_expert_cache_layer(int il, std::string& err) {
 
 void* Model::dev_alloc(int64_t bytes) {
     bytes = align_up(bytes);
+    if (dspark_alloc_) {
+        void* p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, (size_t)bytes));
+        dspark_ptrs_.push_back(p);
+        dspark_bytes_ += bytes;
+        return p;
+    }
     SQ_CHECK(dev_used_ + bytes <= dev_cap_, "device weight arena overflow");
     void* p = dev_arena_ + dev_used_;
     dev_used_ += bytes;
@@ -393,6 +401,67 @@ const float* Model::upload_vec(const GgufTensor& t) {
         CUDA_CHECK(cudaMemcpy(w, f.data(), f.size() * 4, cudaMemcpyHostToDevice));
     }
     return w;
+}
+
+bool Model::load_dspark(const std::string& path, std::string& err) {
+    if (!dspark_gguf.open(path, err)) return false;
+    struct AllocGuard {
+        bool& flag;
+        ~AllocGuard() { flag = false; }
+    } alloc_guard{dspark_alloc_};
+    dspark_alloc_ = true;
+    try {
+        const GgufFile& G = dspark_gguf;
+        DSparkW& D = dspark;
+        D.n_layer = (int)G.i64("dflash.block_count");
+        D.n_embd = (int)G.i64("dflash.embedding_length");
+        D.n_ff = (int)G.i64("dflash.feed_forward_length");
+        D.n_head = (int)G.i64("dflash.attention.head_count");
+        D.n_head_kv = (int)G.i64("dflash.attention.head_count_kv");
+        D.head_dim = (int)G.i64("dflash.attention.key_length");
+        D.block_size = (int)G.i64("dflash.block_size");
+        D.rope_base = (float)G.num("dflash.rope.freq_base", 1e7);
+        D.eps = (float)G.num("dflash.attention.layer_norm_rms_epsilon", 1e-6);
+        D.mask_id = (int)G.i64("tokenizer.ggml.mask_token_id");
+        for (double v : G.arr("dflash.target_layers")) D.target_layers.push_back((int)v);
+        SQ_CHECK(D.n_layer == 5 && D.n_embd == cfg.n_embd && D.head_dim == cfg.head_dim &&
+                 D.n_head == 8 && D.n_head_kv == 2, "DSpark geometry mismatch");
+        SQ_CHECK((int)D.target_layers.size() * D.n_embd == (int)G.need("fc.weight").ne[0],
+                 "DSpark target tap width mismatch");
+        const int64_t before = dspark_bytes_;
+        D.layers.resize((size_t)D.n_layer);
+        for (int il = 0; il < D.n_layer; ++il) {
+            DSparkLayerW& L = D.layers[(size_t)il];
+            const std::string p = "blk." + std::to_string(il) + ".";
+            L.attn_norm = upload_vec(G.need(p + "attn_norm.weight"));
+            L.q_norm = upload_vec(G.need(p + "attn_q_norm.weight"));
+            L.k_norm = upload_vec(G.need(p + "attn_k_norm.weight"));
+            L.ffn_norm = upload_vec(G.need(p + "ffn_norm.weight"));
+            L.q = upload_q8({&G.need(p + "attn_q.weight")});
+            L.k = upload_q8({&G.need(p + "attn_k.weight")});
+            L.v = upload_q8({&G.need(p + "attn_v.weight")});
+            L.o = upload_q8({&G.need(p + "attn_output.weight")});
+            L.gate = upload_q8({&G.need(p + "ffn_gate.weight")});
+            L.up = upload_q8({&G.need(p + "ffn_up.weight")});
+            L.down = upload_q8({&G.need(p + "ffn_down.weight")});
+        }
+        D.fc = upload_q8({&G.need("fc.weight")});
+        D.enc_norm = upload_vec(G.need("enc.output_norm.weight"));
+        D.out_norm = upload_vec(G.need("output_norm.weight"));
+        D.conf_proj = upload_vec(G.need("conf_proj.weight"));
+        D.conf_bias = upload_vec(G.need("conf_proj.bias"));
+        D.markov_w1 = upload_q8({&G.need("markov_w1.weight")});
+        D.markov_w2 = upload_q8({&G.need("markov_w2.weight")});
+        D.loaded = true;
+        log("DSpark drafter: %d layers, %d/%d heads, head_dim %d, block %d, taps %zu, mask %d, %.1f MiB device",
+            D.n_layer, D.n_head, D.n_head_kv, D.head_dim, D.block_size, D.target_layers.size(), D.mask_id,
+            (double)(dspark_bytes_ - before) / 1048576.0);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    dspark_gguf.drop_pages_except("", false);
+    return true;
 }
 
 bool Model::load(const std::string& path, const std::string& mtp_path, bool with_mtp, std::string& err) {

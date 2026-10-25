@@ -1,5 +1,7 @@
 // engine.cpp - see engine.hpp.
 #include "engine.hpp"
+#include "dspark_cpu.hpp"
+#include "dspark_gpu.cuh"
 
 #include "common.hpp"
 #include "cpu_lm_head.hpp"
@@ -68,6 +70,7 @@ Engine::Engine() = default;
 
 Engine::~Engine() {
     if (trace_fp_) { std::fclose(trace_fp_); trace_fp_ = nullptr; }
+    if (tap_fp_) { std::fclose(tap_fp_); tap_fp_ = nullptr; }
     // Graph host callbacks may still need the CPU pool. Drain every graph branch before stopping its workers.
     if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     if (miss_copy_stream_) cudaStreamSynchronize(miss_copy_stream_);
@@ -239,7 +242,40 @@ bool Engine::init(const EngineOptions& opt, std::string& err) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     log("GPU: %s, %.1f GiB, sm_%d%d", prop.name, prop.totalGlobalMem / 1073741824.0, prop.major, prop.minor);
     if (!model_.load(opt.model_path, opt.mtp_model_path, opt_.mtp_draft > 0, err)) return false;
+    if (!opt_.dspark_model_path.empty() && !model_.load_dspark(opt_.dspark_model_path, err)) return false;
     const Config& c = model_.cfg;
+    if (const char* tap_path = std::getenv("STRATA_DUMP_TAPS"); tap_path && *tap_path) {
+        tap_fp_ = std::fopen(tap_path, "wb");
+        SQ_CHECK(tap_fp_ != nullptr, "cannot open STRATA_DUMP_TAPS %s", tap_path);
+        const uint32_t magic = 0x4b505444u;   // DTPK
+        const uint32_t n_embd = (uint32_t)c.n_embd;
+        std::fwrite(&magic, sizeof(magic), 1, tap_fp_);
+        std::fwrite(&n_embd, sizeof(n_embd), 1, tap_fp_);
+        tap_mask_.assign((size_t)c.n_layer, 0);
+        const char* list = std::getenv("STRATA_DUMP_TAP_LAYERS");
+        const std::string layers = list && *list ? list : "3,4,11,12,19,20,27,28,35,36";
+        size_t pos = 0;
+        while (pos < layers.size()) {
+            size_t end = layers.find(',', pos);
+            const std::string item = layers.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (!item.empty()) {
+                const int il = std::atoi(item.c_str());
+                SQ_CHECK(il >= 0 && il < c.n_layer, "STRATA_DUMP_TAP_LAYERS layer %d out of range", il);
+                tap_mask_[(size_t)il] = 1;
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        log("tap dump: %s, layers %s", tap_path, layers.c_str());
+    }
+    if (model_.dspark.loaded) {
+        dspark_tap_tokens_ = std::min(opt_.ctx, 8192);
+        dspark_taps_.assign((size_t)model_.dspark.target_layers.size() * (size_t)dspark_tap_tokens_ *
+                                (size_t)c.n_embd, 0.0f);
+        log("DSpark tap buffer: %zu layers x %d tokens x %d, %.1f MiB host",
+            model_.dspark.target_layers.size(), dspark_tap_tokens_, c.n_embd,
+            (double)dspark_taps_.size() * sizeof(float) / 1048576.0);
+    }
     if (model_.cpu_lm_head) {
         opt_.use_graph = false;
         opt_.prefill_chunk = 0;
@@ -1505,6 +1541,29 @@ void Engine::capture_prompt_route_graph(int il) {
 
 void Engine::build_layer(cudaStream_t s, int il, int T, const StepParams* P, const float* next_w, float* snap) {
     const Config& c = model_.cfg;
+    if (tap_fp_ && il >= 0 && il < (int)tap_mask_.size() && tap_mask_[(size_t)il]) {
+        std::vector<float> h((size_t)T * (size_t)c.n_embd);
+        CUDA_CHECK(cudaMemcpyAsync(h.data(), x_, h.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        const uint32_t hdr[4] = {(uint32_t)n_past_, (uint32_t)T, (uint32_t)il, (uint32_t)c.n_embd};
+        std::fwrite(hdr, sizeof(uint32_t), 4, tap_fp_);
+        std::fwrite(h.data(), sizeof(float), h.size(), tap_fp_);
+        std::fflush(tap_fp_);
+    }
+    if (!dspark_taps_.empty() && il < c.n_layer && n_past_ >= 0 && n_past_ + T <= dspark_tap_tokens_) {
+        const auto& targets = model_.dspark.target_layers;
+        for (size_t k = 0; k < targets.size(); ++k) {
+            if (targets[k] != il) continue;
+            std::vector<float> h((size_t)T * (size_t)c.n_embd);
+            CUDA_CHECK(cudaMemcpyAsync(h.data(), x_, h.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaStreamSynchronize(s));
+            for (int t = 0; t < T; ++t)
+                std::memcpy(&dspark_taps_[((size_t)k * dspark_tap_tokens_ + (size_t)(n_past_ + t)) *
+                                          (size_t)c.n_embd],
+                            h.data() + (size_t)t * c.n_embd, (size_t)c.n_embd * sizeof(float));
+            break;
+        }
+    }
     double cpu_started = 0;
     PipelineLayer* profile = profile_pipeline_ ? &pipeline_layers_[il] : nullptr;
     if (profile) {
@@ -2390,6 +2449,7 @@ Engine::CpuExpertBench Engine::debug_cpu_expert_bench(int layer, int tokens, int
 
 void Engine::feed(const int* tokens, int n) {
     if (n <= 0) return;
+    if (std::getenv("STRATA_DSPARK_DEBUG")) log("DSFEED n=%d n_past=%d chunk=%d", n, n_past_, opt_.prefill_chunk);
     SQ_CHECK(n_past_ + n <= opt_.ctx, "prompt exceeds the context (%d + %d > %d)", n_past_, n, opt_.ctx);
     struct PromptScope {
         bool& head;
@@ -2658,6 +2718,69 @@ void Engine::feed(const int* tokens, int n) {
         }
         decode_one(tokens[i]);
     }
+}
+
+bool Engine::dspark_debug_draft(std::string& err) {
+    if (!model_.dspark.loaded) { err = "DSpark drafter not loaded"; return false; }
+    const int nt = (int)model_.dspark.target_layers.size();
+    const int ne = model_.cfg.n_embd;
+    if (n_past_ <= 0 || n_past_ > dspark_tap_tokens_ || history_.empty()) {
+        err = "DSpark tap buffer is not populated for this position";
+        return false;
+    }
+    std::vector<float> rows((size_t)n_past_ * (size_t)nt * (size_t)ne);
+    for (int p = 0; p < n_past_; ++p)
+        for (int k = 0; k < nt; ++k)
+            std::memcpy(&rows[((size_t)p * nt + k) * ne],
+                        &dspark_taps_[((size_t)k * dspark_tap_tokens_ + p) * ne], (size_t)ne * sizeof(float));
+    std::vector<int> out;
+    const int anchor = history_.back();
+    // Model::load closes the main GGUF mapping after the load; reopen it for the host lm_head/embedding.
+    GgufFile target;
+    if (!target.open(opt_.model_path, err)) return false;
+    const double t_draft = now_ms();
+    if (!dspark_cpu_draft(model_.dspark_gguf, target, rows, n_past_, anchor, n_past_, out, err))
+        return false;
+    const double draft_ms = now_ms() - t_draft;
+    std::string s;
+    for (int t : out) s += std::to_string(t) + " ";
+    log("DSpark debug drafts (anchor %d, pos0 %d, %.0f ms): %s", anchor, n_past_, draft_ms, s.c_str());
+    return true;
+}
+
+
+bool Engine::dspark_gpu_debug_draft(std::string& err) {
+    if (!model_.dspark.loaded) { err = "DSpark drafter not loaded"; return false; }
+    const int nt = (int)model_.dspark.target_layers.size();
+    const int ne = model_.cfg.n_embd;
+    if (n_past_ <= 0 || n_past_ > dspark_tap_tokens_ || history_.empty()) {
+        err = "DSpark tap buffer is not populated for this position";
+        return false;
+    }
+    std::vector<float> rows((size_t)n_past_ * nt * ne);
+    for (int p = 0; p < n_past_; ++p)
+        for (int k = 0; k < nt; ++k)
+            std::memcpy(&rows[((size_t)p * nt + k) * ne],
+                        &dspark_taps_[((size_t)k * dspark_tap_tokens_ + p) * ne], (size_t)ne * 4);
+    GgufFile target;
+    if (!target.open(opt_.model_path, err)) return false;
+    const GgufTensor& emb = target.need("token_embd.weight");
+    const int64_t emb_row = emb.bytes / emb.ne[1];
+    const int anchor = history_.back();
+    int ids[4] = {anchor, model_.dspark.mask_id, model_.dspark.mask_id, model_.dspark.mask_id};
+    std::vector<float> emb_rows((size_t)4 * ne);
+    for (int t = 0; t < 4; ++t)
+        dequant_row(emb.type, emb.data + (int64_t)ids[t] * emb_row, emb_rows.data() + (size_t)t * ne, ne);
+    std::vector<int> out;
+    std::vector<float> conf;
+    const double t0 = now_ms();
+    if (!dspark_gpu_draft(model_.dspark, model_.lm_head, model_.cfg.n_vocab, rows, n_past_, emb_rows,
+                          n_past_, anchor, out, conf, err)) return false;
+    const double t1 = now_ms();
+    std::string s;
+    for (size_t i = 0; i < out.size(); ++i) s += std::to_string(out[i]) + "(" + std::to_string(conf[i]) + ") ";
+    log("DSpark GPU drafts (anchor %d, pos0 %d): %s [%.1f ms]", anchor, n_past_, s.c_str(), t1 - t0);
+    return true;
 }
 
 void Engine::reset() {

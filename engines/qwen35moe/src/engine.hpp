@@ -32,6 +32,7 @@ namespace sq {
 struct EngineOptions {
     std::string model_path;
     std::string mtp_model_path;      // optional GGUF supplying the MTP block (e.g. Qwen3.6 for MiniCPM-V 4.7)
+    std::string dspark_model_path;   // optional MiniCPM DSpark drafter sidecar (dflash GGUF)
     int ctx = 32768;
     int cpu_threads = 8;
     int64_t vram_reserve_mb = 32;  // left free on the card once the engine is ready (other programs, driver)
@@ -235,6 +236,10 @@ public:
     CpuExpertBench debug_cpu_expert_bench(int layer, int tokens, int distinct_experts, int iterations,
                                           int warmups = 3, int expert_offset = 0);
     std::vector<std::vector<float>>* debug_layers = nullptr;   // --no-graph only: token 0's x after every layer
+    /// Experimental debug only: DSpark is not part of spec_step; MTP remains the default path.
+    /// Run the CPU 4-draft forward from the captured tap buffer (anchor = last fed token).
+    bool dspark_debug_draft(std::string& err);
+    bool dspark_gpu_debug_draft(std::string& err);
 
 private:
     friend class Prefill;
@@ -250,6 +255,10 @@ private:
                    double join_ms, double draft_ms, double verify_ms, double adapt_ms, double cpu_wait_ms,
                    int accepted, int drafted, uint64_t misses);
     FILE* trace_fp_ = nullptr;                // STRATA_EVENT_TRACE output (decode timeline)
+    FILE* tap_fp_ = nullptr;                  // STRATA_DUMP_TAPS output (debug layer-input taps)
+    std::vector<uint8_t> tap_mask_;           // one flag per target layer
+    std::vector<float> dspark_taps_;          // [tap][token][n_embd] target layer inputs
+    int dspark_tap_tokens_ = 0;               // captured token limit (min(ctx, 8192))
     double step_host_cpu_wait_ms_ = 0;        // host block inside cpu_->end_layer during this step
     uint64_t step_misses_ = 0;                // expert misses dispatched to CPU workers this step
     std::vector<uint32_t> miss_expert_counts_; // [layer][expert] decode miss pairs since begin_request

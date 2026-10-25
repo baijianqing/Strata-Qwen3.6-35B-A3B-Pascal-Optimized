@@ -95,6 +95,32 @@ struct LayerW {
     const uint8_t* expert_blob(int e) const { return experts + (int64_t)e * blob_bytes; }
 };
 
+/// Experimental MiniCPM-V 4.7 DSpark drafter (loaded only with --dspark-model).  It is not wired into
+/// spec_step; the default MTP D3 path and its performance are unchanged.
+struct DSparkLayerW {
+    const float* attn_norm = nullptr;
+    const float* q_norm = nullptr;
+    const float* k_norm = nullptr;
+    const float* ffn_norm = nullptr;
+    DQ8 q, k, v, o;
+    DQ8 gate, up, down;
+};
+
+struct DSparkW {
+    bool loaded = false;
+    int n_layer = 0, n_embd = 0, n_ff = 0;
+    int n_head = 0, n_head_kv = 0, head_dim = 0;
+    int block_size = 0, mask_id = 0;
+    std::vector<int> target_layers;
+    float rope_base = 1e7f, eps = 1e-6f;
+    std::vector<DSparkLayerW> layers;
+    const float* enc_norm = nullptr;
+    const float* out_norm = nullptr;
+    const float* conf_proj = nullptr;
+    const float* conf_bias = nullptr;
+    DQ8 fc, markov_w1, markov_w2;
+};
+
 /// The MTP block's own weights; its decoder layer is layers[n_layer].
 struct MtpW {
     const float* enorm = nullptr;      // rmsnorm of the next token's embedding
@@ -126,6 +152,9 @@ public:
     /// `mtp_path` optionally supplies the MTP block (blk.<n_layer>.nextn.* and its layer weights) from a
     /// second GGUF of the same family; the main weights, embedding and LM head stay in `path`.
     bool load(const std::string& path, const std::string& mtp_path, bool with_mtp, std::string& err);
+    /// Optional MiniCPM DSpark drafter sidecar (dflash GGUF); loaded after the main model so the
+    /// expert-cache budget sees its device bytes.
+    bool load_dspark(const std::string& path, std::string& err);
     int64_t release_lm_head();  // returns device bytes lent; valid only when phase_lm_head is enabled
     void restore_lm_head();
     void embed(int token, float* out) const;   // dequantize one embedding row (host)
@@ -133,11 +162,16 @@ public:
 
     GgufFile gguf;
     GgufFile mtp_gguf;              // optional sidecar holding the MTP layer when the main GGUF has none
+    GgufFile dspark_gguf;           // optional MiniCPM DSpark drafter sidecar
+    DSparkW dspark;
     bool mtp_sidecar_ = false;
 
 private:
     uint8_t* dev_arena_ = nullptr;
     int64_t dev_used_ = 0, dev_cap_ = 0;
+    bool dspark_alloc_ = false;           // dev_alloc uses separate cudaMalloc blocks for the sidecar
+    std::vector<void*> dspark_ptrs_;
+    int64_t dspark_bytes_ = 0;
     std::vector<uint8_t*> pinned_;
     std::vector<uint8_t*> pageable_;   // experts allocated with malloc when cudaHostAlloc refuses (WSL2)
     std::vector<uint8_t> tok_embd_copy_;

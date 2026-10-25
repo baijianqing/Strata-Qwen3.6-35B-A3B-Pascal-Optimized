@@ -58,7 +58,10 @@ add_library(sq_core STATIC
   src/model.cpp
   src/engine.cpp
   src/sampler.cpp
+  src/dspark_cpu.cpp
   src/kernels.cu
+  src/dspark_gpu.cu
+  src/dspark_forward.cu
   src/dense_q6.cu
   src/mtp_subset.cu
   src/kv_int8.cu
@@ -223,3 +226,6 @@ target_link_libraries(test_cpu_phase_profile PRIVATE sq_cpu)
 
 add_executable(test_prompt_full_graph EXCLUDE_FROM_ALL src/test_prompt_full_graph.cpp)
 target_link_libraries(test_prompt_full_graph PRIVATE sq_core)
+
+add_executable(test_dspark_cpu src/test_dspark_cpu.cpp)
+target_link_libraries(test_dspark_cpu PRIVATE sq_cpu)

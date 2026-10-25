@@ -92,6 +92,8 @@ void usage() {
         "  --prefill-chunk N  tokens per prefill pass (default 4096; 0 = decode-only, saves VRAM)\n"
         "  --ckpt-slots N     prefix-reuse checkpoints (default 3, ~66 MiB each; 0 = disabled)\n"
         "  --mtp-model FILE   take the MTP block from another GGUF of this family (main weights stay in -m)\n"
+        "  --dspark-model FILE  load a MiniCPM DSpark drafter sidecar (dflash GGUF; experimental, not used for\n"
+        "                     generation; the default MTP path is unchanged)\n"
         "  --mtp-draft N      speculative decoding: up to N tokens drafted per step by the MTP block (default 3,\n"
         "                     max 3; 0 = off and the MTP block is not loaded; also --mtp)\n"
         "  --draft-p P        keep drafting while the MTP's probability of the drafts so far is >= P (default 0.8)\n"
@@ -853,6 +855,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--no-pin") opt.pin_threads = false;
         else if (a == "--mtp-model") opt.mtp_model_path = next();
+        else if (a == "--dspark-model") opt.dspark_model_path = next();
         else if (a == "--mtp-window") opt.mtp_window = std::stoi(next());
         else if (a == "--mtp" || a == "--mtp-draft") opt.mtp_draft = std::stoi(next());
         else if (a == "--no-mtp") opt.mtp_draft = 0;
@@ -1076,7 +1079,19 @@ int main(int argc, char** argv) {
     }
     if (ids.empty()) { usage(); return 1; }
     const double t0 = now_ms();
-    eng.feed(ids.data(), (int)ids.size());
+    if (opt.prefill_chunk == 0) {
+        const int step = std::getenv("STRATA_DSPARK_DEBUG") ? 1 : kMaxT;
+        for (int pos = 0; pos < (int)ids.size(); pos += step)
+            eng.feed(ids.data() + pos, std::min<int>(step, (int)ids.size() - pos));
+    } else {
+        eng.feed(ids.data(), (int)ids.size());
+    }
+    if (std::getenv("STRATA_DSPARK_DEBUG")) {
+        std::string dspark_err;
+        const bool gpu = std::getenv("STRATA_DSPARK_GPU") != nullptr;
+        const bool ok = gpu ? eng.dspark_gpu_debug_draft(dspark_err) : eng.dspark_debug_draft(dspark_err);
+        if (!ok) std::fprintf(stderr, "DSpark debug: %s\n", dspark_err.c_str());
+    }
     eng.mem_trace("prefill");
     const double t1 = now_ms();
     if (!dump_logits.empty()) {
